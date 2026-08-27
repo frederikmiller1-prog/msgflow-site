@@ -1,0 +1,3117 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Msg Flow">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>MSGFLOW — SMS Platform</title>
+<script>
+// ── MINIMAL SIP/WebRTC KLIENT ───────────────────────────────────
+// Implementerer SIP over WebSocket (RFC 3261) + WebRTC
+// Kompatibel med SIPUP og standard SIP servere
+
+window._jssipLoaded = true;
+window._jssipCallbacks = [];
+window._onJsSIPReady = function(cb){ cb(); };
+// Rigtig JsSIP loaded via CDN — overskriver minimal klient
+
+var JsSIP = (function(){
+  'use strict';
+
+  function generateCallId(){ return Math.random().toString(36).substr(2,12).toUpperCase()+'@msgflow'; }
+  function generateTag(){ return Math.random().toString(36).substr(2,8); }
+  function generateBranch(){ return 'z9hG4bK'+Math.random().toString(36).substr(2,12); }
+  function generateCSeq(){ return Math.floor(Math.random()*9000)+1000; }
+
+  function WebSocketInterface(url){
+    this.url = url;
+    this.ws = null;
+    this._ua = null;
+  }
+
+  function UA(config){
+    this._config = config;
+    this._socket = config.sockets[0];
+    this._socket._ua = this;
+    this._registered = false;
+    this._ws = null;
+    this._session = null;
+    this._listeners = {};
+    this._callId = generateCallId();
+    this._tag = generateTag();
+    this._cseq = generateCSeq();
+    this._pc = null;
+  }
+
+  UA.prototype.on = function(event, cb){ 
+    this._listeners[event] = this._listeners[event]||[];
+    this._listeners[event].push(cb); 
+  };
+
+  UA.prototype._emit = function(event, data){
+    (this._listeners[event]||[]).forEach(function(cb){ try{cb(data||{});}catch(e){console.error(e);} });
+  };
+
+  UA.prototype.isRegistered = function(){ return this._registered; };
+
+  UA.prototype.start = function(){
+    var self = this;
+    var wsUrl = this._config.sockets[0].url;
+    
+    try {
+      self._ws = new WebSocket(wsUrl, ['sip']);
+    } catch(e){
+      setTimeout(function(){ self._emit('registrationFailed',{cause:e.message}); },100);
+      return;
+    }
+
+    self._ws.onopen = function(){
+      console.log('SIP WS connected');
+      self._sendRegister();
+    };
+
+    self._ws.onmessage = function(e){
+      self._handleMessage(e.data);
+    };
+
+    self._ws.onerror = function(e){
+      console.error('SIP WS error', e);
+      self._emit('registrationFailed',{cause:'Forbindelsesfejl'});
+    };
+
+    self._ws.onclose = function(){
+      console.log('SIP WS closed');
+      self._registered = false;
+      self._emit('unregistered',{});
+    };
+  };
+
+  UA.prototype._send = function(msg){
+    if(this._ws && this._ws.readyState===WebSocket.OPEN){
+      this._ws.send(msg);
+    }
+  };
+
+  UA.prototype._sendRegister = function(){
+    var cfg = this._config;
+    var uri = 'sip:'+cfg.uri.replace('sip:','');
+    var server = uri.split('@')[1]||'sip.sipup.org';
+    var user = uri.split('@')[0].replace('sip:','');
+    this._cseq++;
+    var msg = [
+      'REGISTER sip:'+server+' SIP/2.0',
+      'Via: SIP/2.0/WSS '+server+';branch='+generateBranch()+';rport',
+      'Max-Forwards: 70',
+      'From: <'+uri+'>;tag='+this._tag,
+      'To: <'+uri+'>',
+      'Call-ID: '+this._callId,
+      'CSeq: '+this._cseq+' REGISTER',
+      'Contact: <sip:'+user+'@msgflow.app;transport=wss>;expires=300',
+      'Expires: 300',
+      'Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,REGISTER',
+      'Content-Length: 0',
+      '',''
+    ].join('\r\n');
+    this._send(msg);
+  };
+
+  UA.prototype._handleMessage = function(data){
+    var self = this;
+    var firstLine = (data||'').split('\r\n')[0] || (data||'').split('\n')[0] || '';
+    console.log('SIP RX:', firstLine);
+
+    // 200 OK til REGISTER
+    if(firstLine.includes('200') && data.includes('CSeq:') && 
+       (data.match(/CSeq:\s*\d+\s*REGISTER/i))){
+      self._registered = true;
+      self._emit('registered',{});
+      return;
+    }
+
+    // 401/407 — Authentication required
+    if((firstLine.includes('401')||firstLine.includes('407')) && data.match(/CSeq:\s*\d+\s*REGISTER/i)){
+      var wwwAuth = data.match(/WWW-Authenticate:\s*(.+)/i)||data.match(/Proxy-Authenticate:\s*(.+)/i);
+      if(wwwAuth) self._sendRegisterAuth(wwwAuth[1]);
+      return;
+    }
+
+    // INVITE fra remote (indgående opkald)
+    if(firstLine.startsWith('INVITE')){
+      var session = new Session(self, data, 'incoming');
+      self._session = session;
+      self._emit('newRTCSession',{session:session, originator:'remote'});
+      return;
+    }
+
+    // 200 OK til INVITE (udgående opkald accepteret)
+    if(firstLine.includes('200') && data.match(/CSeq:\s*\d+\s*INVITE/i)){
+      if(self._session) self._session._onAccepted(data);
+      return;
+    }
+
+    // 180 Ringing
+    if(firstLine.includes('180')){
+      if(self._session) self._session._emit('progress',{});
+      return;
+    }
+
+    // BYE
+    if(firstLine.startsWith('BYE')){
+      if(self._session){ self._session._emit('ended',{cause:'BYE'}); self._session=null; }
+      return;
+    }
+
+    // Fejlkoder
+    if(firstLine.match(/^SIP\/2\.0\s+[45]/)){
+      var code=parseInt(firstLine.split(' ')[1])||0;
+      if(data.match(/CSeq:\s*\d+\s*INVITE/i)){
+        if(self._session){ self._session._emit('failed',{cause:firstLine}); self._session=null; }
+      }
+    }
+  };
+
+  UA.prototype._sendRegisterAuth = function(authHeader){
+    var self = this;
+    var cfg = this._config;
+    var uri = 'sip:'+cfg.uri.replace('sip:','');
+    var server = uri.split('@')[1]||'sip.sipup.org';
+    var user = uri.split('@')[0].replace('sip:','');
+
+    // Parse realm og nonce
+    var realm = (authHeader.match(/realm="([^"]+)"/)||[])[1]||server;
+    var nonce = (authHeader.match(/nonce="([^"]+)"/)||[])[1]||'';
+
+    // MD5 digest
+    function md5hex(s){
+      // Minimal MD5 implementation
+      function safeAdd(x,y){var lsw=(x&0xFFFF)+(y&0xFFFF);var msw=(x>>16)+(y>>16)+(lsw>>16);return(msw<<16)|(lsw&0xFFFF);}
+      function bitRotateLeft(num,cnt){return(num<<cnt)|(num>>>(32-cnt));}
+      function md5cmn(q,a,b,x,s,t){return safeAdd(bitRotateLeft(safeAdd(safeAdd(a,q),safeAdd(x,t)),s),b);}
+      function md5ff(a,b,c,d,x,s,t){return md5cmn((b&c)|((~b)&d),a,b,x,s,t);}
+      function md5gg(a,b,c,d,x,s,t){return md5cmn((b&d)|(c&(~d)),a,b,x,s,t);}
+      function md5hh(a,b,c,d,x,s,t){return md5cmn(b^c^d,a,b,x,s,t);}
+      function md5ii(a,b,c,d,x,s,t){return md5cmn(c^(b|(~d)),a,b,x,s,t);}
+      var bs=[];for(var i=0;i<s.length*8;i+=8)bs[i>>5]|=(s.charCodeAt(i/8)&0xFF)<<(i%32);
+      bs[s.length*8>>5]|=0x80<<((s.length*8)%32);bs[(((s.length*8+64)>>>9)<<4)+14]=s.length*8;
+      var a0=1732584193,b0=-271733879,c0=-1732584194,d0=271733878;
+      for(var i=0;i<bs.length;i+=16){
+        var oa=a0,ob=b0,oc=c0,od=d0;
+        a0=md5ff(a0,b0,c0,d0,bs[i+0],7,-680876936);d0=md5ff(d0,a0,b0,c0,bs[i+1],12,-389564586);c0=md5ff(c0,d0,a0,b0,bs[i+2],17,606105819);b0=md5ff(b0,c0,d0,a0,bs[i+3],22,-1044525330);
+        a0=md5ff(a0,b0,c0,d0,bs[i+4],7,-176418897);d0=md5ff(d0,a0,b0,c0,bs[i+5],12,1200080426);c0=md5ff(c0,d0,a0,b0,bs[i+6],17,-1473231341);b0=md5ff(b0,c0,d0,a0,bs[i+7],22,-45705983);
+        a0=md5ff(a0,b0,c0,d0,bs[i+8],7,1770035416);d0=md5ff(d0,a0,b0,c0,bs[i+9],12,-1958414417);c0=md5ff(c0,d0,a0,b0,bs[i+10],17,-42063);b0=md5ff(b0,c0,d0,a0,bs[i+11],22,-1990404162);
+        a0=md5ff(a0,b0,c0,d0,bs[i+12],7,1804603682);d0=md5ff(d0,a0,b0,c0,bs[i+13],12,-40341101);c0=md5ff(c0,d0,a0,b0,bs[i+14],17,-1502002290);b0=md5ff(b0,c0,d0,a0,bs[i+15],22,1236535329);
+        a0=md5gg(a0,b0,c0,d0,bs[i+1],5,-165796510);d0=md5gg(d0,a0,b0,c0,bs[i+6],9,-1069501632);c0=md5gg(c0,d0,a0,b0,bs[i+11],14,643717713);b0=md5gg(b0,c0,d0,a0,bs[i+0],20,-373897302);
+        a0=md5gg(a0,b0,c0,d0,bs[i+5],5,-701558691);d0=md5gg(d0,a0,b0,c0,bs[i+10],9,38016083);c0=md5gg(c0,d0,a0,b0,bs[i+15],14,-660478335);b0=md5gg(b0,c0,d0,a0,bs[i+4],20,-405537848);
+        a0=md5gg(a0,b0,c0,d0,bs[i+9],5,568446438);d0=md5gg(d0,a0,b0,c0,bs[i+14],9,-1019803690);c0=md5gg(c0,d0,a0,b0,bs[i+3],14,-187363961);b0=md5gg(b0,c0,d0,a0,bs[i+8],20,1163531501);
+        a0=md5gg(a0,b0,c0,d0,bs[i+13],5,-1444681467);d0=md5gg(d0,a0,b0,c0,bs[i+2],9,-51403784);c0=md5gg(c0,d0,a0,b0,bs[i+7],14,1735328473);b0=md5gg(b0,c0,d0,a0,bs[i+12],20,-1926607734);
+        a0=md5hh(a0,b0,c0,d0,bs[i+5],4,-378558);d0=md5hh(d0,a0,b0,c0,bs[i+8],11,-2022574463);c0=md5hh(c0,d0,a0,b0,bs[i+11],16,1839030562);b0=md5hh(b0,c0,d0,a0,bs[i+14],23,-35309556);
+        a0=md5hh(a0,b0,c0,d0,bs[i+1],4,-1530992060);d0=md5hh(d0,a0,b0,c0,bs[i+4],11,1272893353);c0=md5hh(c0,d0,a0,b0,bs[i+7],16,-155497632);b0=md5hh(b0,c0,d0,a0,bs[i+10],23,-1094730640);
+        a0=md5hh(a0,b0,c0,d0,bs[i+13],4,681279174);d0=md5hh(d0,a0,b0,c0,bs[i+0],11,-358537222);c0=md5hh(c0,d0,a0,b0,bs[i+3],16,-722521979);b0=md5hh(b0,c0,d0,a0,bs[i+6],23,76029189);
+        a0=md5hh(a0,b0,c0,d0,bs[i+9],4,-640364487);d0=md5hh(d0,a0,b0,c0,bs[i+12],11,-421815835);c0=md5hh(c0,d0,a0,b0,bs[i+15],16,530742520);b0=md5hh(b0,c0,d0,a0,bs[i+2],23,-995338651);
+        a0=md5ii(a0,b0,c0,d0,bs[i+0],6,-198630844);d0=md5ii(d0,a0,b0,c0,bs[i+7],10,1126891415);c0=md5ii(c0,d0,a0,b0,bs[i+14],15,-1416354905);b0=md5ii(b0,c0,d0,a0,bs[i+5],21,-57434055);
+        a0=md5ii(a0,b0,c0,d0,bs[i+12],6,1700485571);d0=md5ii(d0,a0,b0,c0,bs[i+3],10,-1894986606);c0=md5ii(c0,d0,a0,b0,bs[i+10],15,-1051523);b0=md5ii(b0,c0,d0,a0,bs[i+1],21,-2054922799);
+        a0=md5ii(a0,b0,c0,d0,bs[i+8],6,1873313359);d0=md5ii(d0,a0,b0,c0,bs[i+15],10,-30611744);c0=md5ii(c0,d0,a0,b0,bs[i+6],15,-1560198380);b0=md5ii(b0,c0,d0,a0,bs[i+13],21,1309151649);
+        a0=md5ii(a0,b0,c0,d0,bs[i+4],6,-145523070);d0=md5ii(d0,a0,b0,c0,bs[i+11],10,-1120210379);c0=md5ii(c0,d0,a0,b0,bs[i+2],15,718787259);b0=md5ii(b0,c0,d0,a0,bs[i+9],21,-343485551);
+        a0=safeAdd(a0,oa);b0=safeAdd(b0,ob);c0=safeAdd(c0,oc);d0=safeAdd(d0,od);
+      }
+      function int32ToHex(n){var s='';for(var j=0;j<4;j++)s+=(('0'+(n>>>(j*8)&0xFF).toString(16)).slice(-2));return s;}
+      return int32ToHex(a0)+int32ToHex(b0)+int32ToHex(c0)+int32ToHex(d0);
+    }
+
+    var ha1=md5hex(cfg.uri.split('@')[0].replace('sip:','')+':'+realm+':'+cfg.password);
+    var ha2=md5hex('REGISTER:sip:'+server);
+    var resp=md5hex(ha1+':'+nonce+':'+ha2);
+
+    self._cseq++;
+    var authValue='Digest username="'+user+'",realm="'+realm+'",nonce="'+nonce+'",uri="sip:'+server+'",response="'+resp+'",algorithm=MD5';
+    var msg=[
+      'REGISTER sip:'+server+' SIP/2.0',
+      'Via: SIP/2.0/WSS '+server+';branch='+generateBranch()+';rport',
+      'Max-Forwards: 70',
+      'From: <'+uri+'>;tag='+self._tag,
+      'To: <'+uri+'>',
+      'Call-ID: '+self._callId,
+      'CSeq: '+self._cseq+' REGISTER',
+      'Contact: <sip:'+user+'@msgflow.app;transport=wss>;expires=300',
+      'Expires: 300',
+      'Authorization: '+authValue,
+      'Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,REGISTER',
+      'Content-Length: 0',
+      '',''
+    ].join('\r\n');
+    self._send(msg);
+  };
+
+  UA.prototype.call = function(target, options){
+    var self = this;
+    var session = new Session(self, null, 'outgoing');
+    session._target = target;
+    session._options = options||{};
+    self._session = session;
+    session._startOutgoing();
+    return session;
+  };
+
+  UA.prototype.stop = function(){
+    if(this._ws) this._ws.close();
+    this._registered = false;
+  };
+
+  // ── SESSION ──────────────────────────────────────────────────
+  function Session(ua, rawMsg, direction){
+    this._ua = ua;
+    this._raw = rawMsg;
+    this._direction = direction;
+    this._listeners = {};
+    this._pc = null;
+    this._callId = generateCallId();
+    this._tag = generateTag();
+    this._remoteTag = generateTag();
+    this._cseq = generateCSeq();
+    this._localSdp = null;
+    this.connection = null;
+  }
+
+  Session.prototype.on = function(event, cb){
+    this._listeners[event]=this._listeners[event]||[];
+    this._listeners[event].push(cb);
+  };
+  Session.prototype._emit = function(event,data){
+    (this._listeners[event]||[]).forEach(function(cb){ try{cb(data||{});}catch(e){} });
+  };
+  Session.prototype.isInProgress = function(){ return true; };
+  Session.prototype.isEstablished = function(){ return this._established||false; };
+
+  Session.prototype._startOutgoing = async function(){
+    var self = this;
+    var cfg = self._ua._config;
+    var uri = 'sip:'+cfg.uri.replace('sip:','');
+    var server = uri.split('@')[1]||'sip.sipup.org';
+    var user = uri.split('@')[0].replace('sip:','');
+
+    // WebRTC PeerConnection
+    try{
+      self._pc = new RTCPeerConnection({
+        iceServers:[
+          {urls:'stun:stun.l.google.com:19302'},
+          {urls:'stun:stun1.l.google.com:19302'}
+        ]
+      });
+      self.connection = self._pc;
+
+      // Hent mikrofon
+      var stream = await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+      stream.getTracks().forEach(function(t){ self._pc.addTrack(t,stream); });
+
+      self._pc.ontrack = function(e){
+        self._emit('addStream',{stream:e.streams[0]});
+        var audio=document.getElementById('remoteAudio');
+        if(!audio){ audio=document.createElement('audio'); audio.id='remoteAudio'; audio.autoplay=true; document.body.appendChild(audio); }
+        audio.srcObject=e.streams[0];
+      };
+
+      var offer = await self._pc.createOffer({offerToReceiveAudio:true});
+      await self._pc.setLocalDescription(offer);
+      self._localSdp = offer.sdp;
+
+      // Vent på ICE candidates
+      await new Promise(function(resolve){
+        if(self._pc.iceGatheringState==='complete') return resolve();
+        self._pc.onicecandidate=function(e){ if(!e.candidate) resolve(); };
+        setTimeout(resolve, 3000);
+      });
+
+      // Send INVITE
+      var targetUser = self._target.replace('sip:','').split('@')[0];
+      var body = self._pc.localDescription.sdp;
+      self._cseq++;
+      var invite=[
+        'INVITE '+self._target+' SIP/2.0',
+        'Via: SIP/2.0/WSS '+server+';branch='+generateBranch()+';rport',
+        'Max-Forwards: 70',
+        'From: <'+uri+'>;tag='+self._tag,
+        'To: <'+self._target+'>',
+        'Call-ID: '+self._callId,
+        'CSeq: '+self._cseq+' INVITE',
+        'Contact: <sip:'+user+'@msgflow.app;transport=wss>',
+        'Allow: INVITE,ACK,BYE,CANCEL,OPTIONS',
+        'Content-Type: application/sdp',
+        'Content-Length: '+body.length,
+        '',
+        body
+      ].join('\r\n');
+      self._ua._send(invite);
+      self._emit('progress',{});
+
+    } catch(err){
+      console.error('SIP call error:', err);
+      self._emit('failed',{cause:err.message});
+    }
+  };
+
+  Session.prototype._onAccepted = function(data){
+    var self = this;
+    self._established = true;
+    // Udtræk SDP fra 200 OK
+    var sdpStart = (data.indexOf('\r\n\r\n')+4)||0;
+    var remoteSdp = data.substring(sdpStart);
+    if(remoteSdp && self._pc){
+      self._pc.setRemoteDescription({type:'answer',sdp:remoteSdp}).then(function(){
+        self._emit('accepted',{});
+      }).catch(function(e){ self._emit('accepted',{}); });
+    } else {
+      self._emit('accepted',{});
+    }
+    // Send ACK
+    var cfg=self._ua._config;
+    var uri='sip:'+cfg.uri.replace('sip:','');
+    var server=uri.split('@')[1]||'sip.sipup.org';
+    var user=uri.split('@')[0].replace('sip:','');
+    var ack=[
+      'ACK '+self._target+' SIP/2.0',
+      'Via: SIP/2.0/WSS '+server+';branch='+generateBranch()+';rport',
+      'Max-Forwards: 70',
+      'From: <'+uri+'>;tag='+self._tag,
+      'To: <'+self._target+'>;tag='+self._remoteTag,
+      'Call-ID: '+self._callId,
+      'CSeq: '+self._cseq+' ACK',
+      'Content-Length: 0',
+      '',''
+    ].join('\r\n');
+    self._ua._send(ack);
+  };
+
+  Session.prototype.terminate = function(){
+    var self = this;
+    var cfg = self._ua._config;
+    var uri = 'sip:'+cfg.uri.replace('sip:','');
+    var server = uri.split('@')[1]||'sip.sipup.org';
+    var user = uri.split('@')[0].replace('sip:','');
+    self._cseq++;
+    var bye=[
+      'BYE '+(self._target||('sip:'+server))+' SIP/2.0',
+      'Via: SIP/2.0/WSS '+server+';branch='+generateBranch()+';rport',
+      'Max-Forwards: 70',
+      'From: <'+uri+'>;tag='+self._tag,
+      'To: <'+(self._target||('sip:'+server))+'>;tag='+self._remoteTag,
+      'Call-ID: '+self._callId,
+      'CSeq: '+self._cseq+' BYE',
+      'Content-Length: 0',
+      '',''
+    ].join('\r\n');
+    self._ua._send(bye);
+    if(self._pc){ try{self._pc.close();}catch(e){} }
+    self._emit('ended',{cause:'BYE'});
+  };
+
+  return { UA:UA, WebSocketInterface:WebSocketInterface };
+})();
+
+console.log('Minimal SIP klient indlæst — klar til Telnyx');
+</script>
+<script src="https://cdn.jsdelivr.net/npm/jssip@3.10.0/dist/jssip.min.js"></script>
+<link rel="apple-touch-icon" sizes="180x180" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><defs><linearGradient id='bg' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%23163300'/><stop offset='1' stop-color='%231a3d00'/></linearGradient><linearGradient id='t' x1='0' y1='0' x2='1' y2='0'><stop offset='0' stop-color='%239fe870'/><stop offset='1' stop-color='%2334d399'/></linearGradient></defs><rect width='180' height='180' rx='0' fill='url(%23bg)'/><text x='90' y='82' font-size='44' text-anchor='middle' fill='url(%23t)' font-family='Arial Black,Arial' font-weight='900' letter-spacing='-2'>MSG</text><text x='90' y='128' font-size='44' text-anchor='middle' fill='%23ffffff' font-family='Arial Black,Arial' font-weight='900' letter-spacing='-2'>FLOW</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500&display=swap" rel="stylesheet">
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+:root{
+  --bg:#163300;
+  --bg2:#1a3d00;
+  --s1:rgba(255,255,255,.06);
+  --s2:rgba(255,255,255,.09);
+  --s3:rgba(255,255,255,.13);
+  --bd:rgba(255,255,255,.1);
+  --bd2:rgba(255,255,255,.18);
+  --blue:#9fe870;
+  --blue2:#7dd44a;
+  --cyan:#34d399;
+  --glow:rgba(159,232,112,.15);
+  --glow2:rgba(52,211,153,.1);
+  --tx:#ffffff;
+  --tx2:#d4f0b8;
+  --tx3:#a8c890;
+  --ok:#9fe870;
+  --err:#f87171;
+  --warn:#fbbf24;
+  --gold:#fbbf24;
+}
+html{scroll-behavior:smooth;}
+body{font-family:'DM Mono',ui-monospace,monospace;background:#163300;background-image:radial-gradient(ellipse at 20% 0%,rgba(159,232,112,.08) 0%,transparent 55%),radial-gradient(ellipse at 80% 100%,rgba(52,211,153,.06) 0%,transparent 55%);background-attachment:fixed;color:var(--tx);min-height:100dvh;overflow-x:hidden;-webkit-text-size-adjust:100%;max-width:100vw;}
+
+/* ── NOISE OVERLAY ── */
+body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");pointer-events:none;z-index:0;}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar{width:3px;} ::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:2px;}
+
+/* ── SCREENS ── */
+.screen{display:none;position:relative;z-index:1;}
+.screen.active{display:flex;flex-direction:column;}
+/* Top-niveau screens: fuld skærm */
+#screen-landing.active,#screen-login.active{min-height:100dvh;}
+#screen-landing.active{display:flex;flex-direction:column;}
+#screen-login.active{display:flex;flex-direction:column;}
+
+/* ── APP LAYOUT ── */
+#screen-app{
+  display:none;
+  position:fixed;
+  top:0;left:0;right:0;bottom:0;
+  flex-direction:column;
+  background:#163300;
+}
+#screen-app.active{display:flex;}
+
+/* Nav i app */
+#screen-app>.nav{flex-shrink:0;}
+
+/* Tabs */
+#screen-app>.screen{display:none;position:absolute;top:54px;left:0;right:0;bottom:56px;}
+#screen-app>.screen.active{display:block;}
+
+/* Scroll — simpel og robust */
+#screen-app .scroll{
+  position:absolute;
+  top:0;left:0;right:0;bottom:0;
+  overflow-y:auto;
+  -webkit-overflow-scrolling:touch;
+  padding:16px;
+  padding-bottom:32px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  box-sizing:border-box;
+}
+#screen-app .scroll>*{flex-shrink:0;}
+
+/* Bnav */
+.bnav{
+  display:none;
+  position:fixed;
+  bottom:0;left:0;right:0;
+  z-index:100;
+  height:56px;
+  background:#163300;
+  border-top:1px solid rgba(255,255,255,.1);
+  box-sizing:border-box;
+}
+#screen-app.active .bnav{display:flex;}
+
+/* Safe area justeringer for PWA */
+@supports(padding-bottom: env(safe-area-inset-bottom)){
+  #screen-app>.screen{
+    bottom:calc(56px + env(safe-area-inset-bottom));
+  }
+  .bnav{
+    height:calc(56px + env(safe-area-inset-bottom));
+    padding-bottom:env(safe-area-inset-bottom);
+    bottom:0;
+  }
+  #screen-app{
+    padding-top:env(safe-area-inset-top);
+  }
+  #screen-app>.screen{
+    top:calc(54px + env(safe-area-inset-top));
+  }
+}
+
+/* ── NAV ── */
+.nav{flex-shrink:0;position:sticky;top:0;z-index:100;background:#163300;border-bottom:1px solid rgba(255,255,255,.1);padding:0 16px;height:54px;display:flex;align-items:center;justify-content:space-between;}
+.nav-brand{font-family:'Syne',sans-serif;font-weight:800;font-size:17px;letter-spacing:-.02em;background:linear-gradient(135deg,#9fe870,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.nav-brand span{font-weight:400;-webkit-text-fill-color:rgba(255,255,255,.9);}
+.nav-right{display:flex;align-items:center;gap:6px;}
+.nav-bal{background:rgba(159,232,112,.1);border:1px solid rgba(159,232,112,.25);border-radius:99px;padding:4px 10px;font-size:11px;color:#9fe870;font-weight:600;white-space:nowrap;}
+.nav-btn{background:none;border:none;cursor:pointer;color:var(--tx2);padding:6px;border-radius:6px;display:flex;align-items:center;}
+.nav-btn svg{width:18px;height:18px;stroke:currentColor;stroke-width:1.8;fill:none;}
+
+
+.bn{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;background:none;border:none;cursor:pointer;font-family:'DM Mono',monospace;font-size:9px;font-weight:500;color:var(--tx3);transition:color .2s;position:relative;}
+.bn.active{color:var(--blue);}
+.bn svg{width:19px;height:19px;stroke:currentColor;stroke-width:1.8;fill:none;}
+.bn-dot{position:absolute;top:5px;right:calc(50% - 14px);width:6px;height:6px;background:var(--err);border-radius:50%;border:2px solid var(--bg2);}
+
+/* ── SCROLL AREA ── */
+/* .scroll styles moved to #screen-app .scroll above */
+.scroll>*{flex-shrink:0;}
+
+/* ── CARDS ── */
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;position:relative;}
+.card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(96,165,250,.04) 0%,transparent 60%);pointer-events:none;z-index:0;}
+.card>*{position:relative;z-index:1;}
+.ch{padding:12px 14px 0;font-size:9px;font-weight:700;letter-spacing:.15em;color:var(--tx3);text-transform:uppercase;position:relative;z-index:1;}
+.cb{padding:10px 14px 14px;position:relative;z-index:1;}
+
+/* ── FORMS ── */
+.lbl{font-size:11px;color:var(--tx2);display:block;margin-bottom:5px;letter-spacing:.03em;}
+input,textarea,select{background:var(--s2);border:1px solid var(--bd);border-radius:10px;color:var(--tx);font-family:'DM Mono',monospace;font-size:16px;padding:11px 13px;width:100%;transition:border-color .15s,box-shadow .15s;outline:none;-webkit-appearance:none;-webkit-text-size-adjust:100%;}
+input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.1);}
+textarea{resize:none;line-height:1.6;}
+.field{display:flex;flex-direction:column;gap:0;}
+.hint{font-size:10px;color:var(--tx3);margin-top:5px;line-height:1.5;}
+.meta-row{display:flex;justify-content:space-between;margin-top:4px;font-size:10px;color:var(--tx3);}
+.frow{display:flex;gap:8px;align-items:flex-end;}.frow input{flex:1;}
+
+/* ── BUTTONS ── */
+.btn{display:flex;align-items:center;justify-content:center;gap:8px;border:none;border-radius:10px;font-family:'Syne',sans-serif;font-weight:700;cursor:pointer;transition:all .15s;-webkit-appearance:none;letter-spacing:.01em;-webkit-text-size-adjust:100%;}
+.btn-full{width:100%;padding:13px;font-size:15px;}
+.btn-sm{padding:9px 14px;font-size:13px;}
+.btn-xs{padding:7px 12px;font-size:12px;}
+.btn-blue{background:linear-gradient(160deg,#9fe870,#7dd44a);color:#163300;font-weight:800;box-shadow:0 4px 20px rgba(159,232,112,.2);}
+.btn-blue:active:not(:disabled){transform:scale(.97);}
+.btn-blue:disabled{opacity:.3;cursor:not-allowed;}
+.btn-ghost{background:var(--s2);color:var(--tx);border:1px solid var(--bd);}
+.btn-ghost:active{background:var(--s3);}
+
+/* ── HERO ── */
+.hero{padding:36px 20px 24px;text-align:center;}
+.hero-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(37,99,235,.1);border:1px solid rgba(37,99,235,.3);border-radius:99px;padding:5px 14px;font-size:10px;font-weight:500;color:var(--cyan);letter-spacing:.08em;text-transform:uppercase;margin-bottom:18px;}
+.hero-badge::before{content:'';width:6px;height:6px;background:var(--cyan);border-radius:50%;animation:pulse 2s ease-in-out infinite;}
+.hero-title{font-family:'Syne',sans-serif;font-size:clamp(28px,8vw,40px);font-weight:800;line-height:1.1;letter-spacing:-.03em;margin-bottom:12px;}
+.hero-title .grad{background:linear-gradient(135deg,#9fe870,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.hero-sub{font-size:13px;color:var(--tx2);line-height:1.7;max-width:300px;margin:0 auto 24px;font-family:'DM Mono',monospace;}
+.hero-stats{display:flex;gap:1px;background:var(--bd);border-radius:12px;overflow:hidden;margin-bottom:20px;}
+.stat{flex:1;background:var(--s1);padding:12px 6px;text-align:center;}
+.stat-n{font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:var(--blue);}
+.stat-l{font-size:9px;color:var(--tx3);margin-top:2px;letter-spacing:.06em;}
+
+/* ── PRICING ── */
+.pricing-grid{display:flex;flex-direction:column;gap:10px;}
+.pkg{background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px;position:relative;}
+.pkg.popular{border-color:var(--blue);background:linear-gradient(135deg,rgba(37,99,235,.05),var(--s1));}
+.pkg-badge{position:absolute;top:-10px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,var(--blue),var(--cyan));color:#fff;border-radius:99px;padding:3px 12px;font-size:10px;font-weight:700;font-family:'Syne',sans-serif;white-space:nowrap;}
+.pkg-name{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;margin-bottom:3px;}
+.pkg-price{font-size:26px;font-weight:800;font-family:'Syne',sans-serif;color:var(--blue);margin-bottom:2px;}
+.pkg-period{font-size:11px;color:var(--tx3);margin-bottom:10px;}
+.pkg-features{margin:10px 0;display:flex;flex-direction:column;gap:5px;}
+.pkg-feat{font-size:11px;color:var(--tx2);display:flex;align-items:center;gap:8px;}
+.pkg-feat::before{content:'✓';color:var(--ok);font-weight:700;flex-shrink:0;}
+
+/* ── DASHBOARD ── */
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.dash-card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:12px;text-align:center;}
+.dash-n{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;margin-bottom:3px;}
+.dash-l{font-size:9px;color:var(--tx3);letter-spacing:.06em;}
+.progress-bar{background:var(--s3);border-radius:99px;height:4px;overflow:hidden;margin-top:7px;}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:99px;transition:width .5s ease;}
+
+/* ── CONTACTS ── */
+.import-card{display:flex;align-items:center;gap:12px;background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:12px;cursor:pointer;transition:border-color .15s;}
+.import-card:active{background:var(--s3);border-color:var(--bd2);}
+.import-ico{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-size:16px;flex-shrink:0;}
+.ct-item{display:flex;align-items:center;gap:10px;padding:9px 10px;background:var(--s2);border-radius:9px;}
+.ct-av{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--blue),var(--cyan));font-size:11px;font-weight:700;display:grid;place-items:center;flex-shrink:0;font-family:'Syne',sans-serif;}
+.ct-name{font-size:13px;font-weight:500;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.ct-num{font-size:11px;color:var(--tx3);}
+
+/* ── AUTH ── */
+.auth-wrap{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px 20px;padding-top:calc(28px + env(safe-area-inset-top,0px));gap:0;overflow-y:auto;}
+.auth-logo{font-family:'Syne',sans-serif;font-weight:800;font-size:26px;letter-spacing:-.03em;background:linear-gradient(135deg,var(--blue),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:5px;}
+.auth-sub{font-size:12px;color:var(--tx3);margin-bottom:24px;}
+.auth-card{background:var(--s1);border:1px solid var(--bd);border-radius:18px;padding:20px;width:100%;max-width:360px;display:flex;flex-direction:column;gap:12px;}
+.auth-divider{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--tx3);}
+.auth-divider::before,.auth-divider::after{content:'';flex:1;height:1px;background:var(--bd);}
+
+/* ── LOG ── */
+.log-row{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;background:var(--s1);border-radius:8px;font-size:11px;line-height:1.5;}
+.log-t{font-size:9px;color:var(--tx3);flex-shrink:0;padding-top:1px;}
+.c-ok{color:var(--ok);}.c-err{color:var(--err);}.c-warn{color:var(--warn);}.c-info{color:var(--cyan);}
+
+/* ── SEND BAR ── */
+.send-bar{flex-shrink:0;background:var(--bg2);border-top:1px solid var(--bd);padding:10px 16px;z-index:50;}
+
+/* ── PROGRESS ── */
+.prog-wrap{background:var(--s2);border-radius:10px;padding:12px;}
+.prog-nums{display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;font-weight:600;}
+.prog-track{background:var(--s3);border-radius:99px;height:4px;overflow:hidden;}
+.prog-bar-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:99px;transition:width .35s ease;width:0%;}
+
+/* ── TOAST ── */
+#toast{position:fixed;bottom:70px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--s2);border:1px solid var(--bd2);color:var(--tx);border-radius:99px;padding:8px 16px;font-size:12px;font-weight:500;opacity:0;transition:all .2s;z-index:300;pointer-events:none;white-space:nowrap;max-width:88vw;overflow:hidden;text-overflow:ellipsis;}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+
+/* ── MODALS ── */
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(8px);z-index:200;align-items:flex-end;justify-content:center;}
+.modal-bg.open{display:flex;animation:fadeIn .2s ease;}
+.modal{background:var(--s1);border:1px solid var(--bd);border-radius:20px 20px 0 0;padding:18px 18px calc(18px + env(safe-area-inset-bottom));width:100%;max-width:500px;max-height:90dvh;overflow-y:auto;animation:slideUp .25s ease;}
+@keyframes slideUp{from{transform:translateY(100%);}to{transform:translateY(0);}}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+.modal-handle{width:36px;height:4px;background:var(--bd2);border-radius:99px;margin:0 auto 16px;}
+.modal-title{font-family:'Syne',sans-serif;font-size:17px;font-weight:700;margin-bottom:4px;}
+.modal-sub{font-size:11px;color:var(--tx3);margin-bottom:14px;line-height:1.5;}
+
+/* ── POPUPS ── */
+.popup-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(10px);z-index:400;align-items:center;justify-content:center;padding:20px;}
+.popup-bg.open{display:flex;animation:fadeIn .3s ease;}
+.popup{background:var(--s1);border:1px solid var(--bd);border-radius:22px;padding:28px 20px;width:100%;max-width:340px;text-align:center;animation:popIn .35s cubic-bezier(.34,1.56,.64,1);position:relative;overflow:hidden;}
+@keyframes popIn{from{opacity:0;transform:scale(.85);}to{opacity:1;transform:scale(1);}}
+.popup::before{content:'';position:absolute;top:-40px;left:50%;transform:translateX(-50%);width:180px;height:180px;background:radial-gradient(circle,rgba(37,99,235,.12),transparent 70%);pointer-events:none;}
+.popup-ico{font-size:46px;margin-bottom:10px;animation:bounce .8s ease .2s both;}
+@keyframes bounce{0%{transform:scale(0);}60%{transform:scale(1.15);}100%{transform:scale(1);}}
+.popup-title{font-family:'Syne',sans-serif;font-size:20px;font-weight:800;margin-bottom:7px;letter-spacing:-.02em;}
+.popup-stats{display:flex;gap:8px;margin:14px 0;}
+.pstat{flex:1;background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:11px 6px;}
+.pstat-n{font-family:'Syne',sans-serif;font-size:18px;font-weight:800;}
+.pstat-l{font-size:9px;color:var(--tx3);margin-top:2px;letter-spacing:.05em;}
+.popup-credits{background:rgba(37,99,235,.08);border:1px solid rgba(37,99,235,.2);border-radius:10px;padding:11px;margin-bottom:14px;}
+.popup-cred-n{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;color:var(--blue);}
+.popup-cred-l{font-size:10px;color:var(--tx2);margin-top:2px;}
+canvas#confetti{position:absolute;inset:0;pointer-events:none;border-radius:22px;}
+
+/* ── EMPTY ── */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px;gap:6px;text-align:center;}
+.empty-ico{font-size:32px;margin-bottom:4px;opacity:.4;}
+.empty-t{font-size:13px;font-weight:600;color:var(--tx2);font-family:'Syne',sans-serif;}
+.empty-d{font-size:11px;color:var(--tx3);line-height:1.5;}
+
+/* ── ANIMATIONS ── */
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
+@keyframes float{0%,100%{transform:translateY(0);}50%{transform:translateY(-5px);}}
+@keyframes glow{0%,100%{box-shadow:0 0 20px var(--glow);}50%{box-shadow:0 0 35px var(--glow);}}
+@keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+@keyframes slideDown{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:translateY(0);}}
+.menu-item{display:flex;align-items:center;gap:10px;width:100%;background:none;border:none;color:var(--tx);font-family:'DM Mono',monospace;font-size:13px;padding:11px 16px;cursor:pointer;text-align:left;transition:background .15s;}
+.menu-item:active{background:var(--s3);}
+/* Dialpad keys */
+.dial-key{background:var(--s2);border:1px solid var(--bd);border-radius:12px;color:var(--tx);font-family:'Syne',sans-serif;font-size:20px;font-weight:700;padding:14px 8px 10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px;transition:background .1s;}
+.dial-key span{font-family:'DM Mono',monospace;font-size:8px;color:var(--tx3);letter-spacing:.1em;}
+.dial-key:active{background:var(--s3);}
+</style>
+</head>
+<body>
+
+<!-- ══ LANDING SCREEN ══ -->
+<div class="screen active" id="screen-landing">
+  <div style="flex:1;overflow-y:auto;">
+    <nav style="background:#163300;border-bottom:1px solid rgba(255,255,255,.1);padding:0 20px;padding-top:env(safe-area-inset-top,0px);height:calc(58px + env(safe-area-inset-top,0px));display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10;">
+      <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px;background:linear-gradient(135deg,#9fe870,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">MSG<span style="-webkit-text-fill-color:rgba(255,255,255,.9)">FLOW</span></div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost btn-xs" onclick="showScreen('screen-login')" style="font-family:'DM Mono',monospace;">Log ind</button>
+        
+      </div>
+    </nav>
+
+    <!-- Hero -->
+    <div class="hero">
+      <div class="hero-badge">● SMS PLATFORM</div>
+      <div class="hero-title">Send SMS til<br><span class="grad">10.000 kunder</span><br>på sekunder</div>
+      <div class="hero-sub">Professionel bulk-SMS til din virksomhed. Betal kun for det du bruger. Ingen binding.</div>
+      <div class="hero-stats">
+        <div class="stat"><div class="stat-n">10K</div><div class="stat-l">Kontakter</div></div>
+        <div class="stat"><div class="stat-n">99%</div><div class="stat-l">Levering</div></div>
+        <div class="stat"><div class="stat-n">DK</div><div class="stat-l">Fokus</div></div>
+      </div>
+      <button class="btn btn-blue btn-full" style="margin-bottom:12px;font-size:16px;" onclick="showScreen('screen-login')">
+        Log ind →
+      </button>
+      <button class="btn btn-ghost btn-full" style="margin-bottom:12px;" onclick="scrollToPricing()">Se priser</button>
+
+      <!-- WhatsApp support -->
+      <a href="https://wa.me/447451296037" target="_blank" rel="noreferrer" style="display:flex;align-items:center;gap:12px;background:rgba(37,211,102,.08);border:1px solid rgba(37,211,102,.25);border-radius:14px;padding:12px 16px;text-decoration:none;margin-bottom:10px;">
+        <div style="width:34px;height:34px;border-radius:50%;background:#25D366;display:grid;place-items:center;flex-shrink:0;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+        </div>
+        <div style="flex:1;">
+          <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;color:#25D366;margin-bottom:2px;">Support via WhatsApp</div>
+          <div style="font-size:11px;color:var(--tx2);">Kontakt os direkte for hjælp</div>
+        </div>
+        <svg style="width:16px;height:16px;stroke:#25D366;fill:none;stroke-width:2;opacity:.6" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+      </a>
+
+      <!-- PWA install banner -->
+      <div id="pwaBannerLanding" style="display:flex;align-items:center;gap:10px;background:rgba(22,51,0,.95);border:1px solid rgba(159,232,112,.2);border-radius:10px;padding:10px 12px;">
+        <svg style="width:16px;height:16px;stroke:#9fe870;fill:none;stroke-width:2;flex-shrink:0;" viewBox="0 0 24 24"><path d="M12 2v13m0 0l-4-4m4 4l4-4M3 18v1a2 2 0 002 2h14a2 2 0 002-2v-1"/></svg>
+        <div style="flex:1;font-size:11px;color:var(--tx2);line-height:1.5;">Tryk <strong style="color:#9fe870;">Del ↑</strong> → <strong style="color:#9fe870;">Føj til hjemmeskærm</strong> for fuld app-oplevelse</div>
+        <button onclick="document.getElementById('pwaBannerLanding').style.display='none';" style="background:none;border:none;color:var(--tx3);font-size:14px;cursor:pointer;padding:2px 4px;flex-shrink:0;">✕</button>
+      </div>
+    </div>
+
+    <!-- Features -->
+    <div style="padding:0 20px;display:flex;flex-direction:column;gap:10px;margin-bottom:32px;">
+      <div class="card"><div class="cb" style="display:flex;gap:14px;align-items:center;">
+        <div style="width:44px;height:44px;border-radius:12px;background:rgba(37,99,235,.1);border:1px solid rgba(37,99,235,.2);display:grid;place-items:center;flex-shrink:0;font-size:20px;">📤</div>
+        <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;margin-bottom:3px;">Bulk-afsendelse</div><div style="font-size:11px;color:var(--tx2);line-height:1.5;">Send til alle dine kontakter på én gang med dit firmanavn som afsender.</div></div>
+      </div></div>
+      <div class="card"><div class="cb" style="display:flex;gap:14px;align-items:center;">
+        <div style="width:44px;height:44px;border-radius:12px;background:rgba(6,182,212,.1);border:1px solid rgba(6,182,212,.2);display:grid;place-items:center;flex-shrink:0;font-size:20px;">📱</div>
+        <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;margin-bottom:3px;">Kontakt-import</div><div style="font-size:11px;color:var(--tx2);line-height:1.5;">Importer fra iPhone, Android, Google og CSV på sekunder.</div></div>
+      </div></div>
+      <div class="card"><div class="cb" style="display:flex;gap:14px;align-items:center;">
+        <div style="width:44px;height:44px;border-radius:12px;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.2);display:grid;place-items:center;flex-shrink:0;font-size:20px;">⚡</div>
+        <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;margin-bottom:3px;">Live statistik</div><div style="font-size:11px;color:var(--tx2);line-height:1.5;">Se leveringsstatus, credits og aktivitetslog i realtid.</div></div>
+      </div></div>
+    </div>
+
+    <!-- Pricing -->
+    <div id="pricing-section" style="padding:0 20px;margin-bottom:32px;">
+      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.02em;margin-bottom:16px;text-align:center;">Priser</div>
+      <div class="pricing-grid">
+      <!-- Subscription -->
+      <div style="background:linear-gradient(135deg,rgba(96,165,250,.1),rgba(103,232,249,.05));border:1px solid rgba(96,165,250,.3);border-radius:14px;padding:16px;margin-bottom:4px;">
+        <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;margin-bottom:6px;">📋 Subscription påkrævet</div>
+        <div style="font-size:11px;color:var(--tx2);line-height:1.7;margin-bottom:12px;">For at bruge MSGFLOW Bulk SMS Platform kræves et aktivt abonnement. Subscription giver adgang til platformen — credits til afsendelse købes separat og er meget billigere end de fleste konkurrenter.</div>
+        <div style="background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:12px;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <div>
+            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--blue);">900 kr.</div>
+            <div style="font-size:10px;color:var(--tx3);">6 måneders adgang</div>
+          </div>
+          <button class="btn btn-blue btn-sm" onclick="openBtcModal('subscription','900 kr. — 6 mdr. subscription','900 DKK')">Betal nu 🔐</button>
+        </div>
+        <div style="font-size:10px;color:var(--tx3);line-height:1.6;">✓ Fuld adgang til bulk SMS sender &nbsp;·&nbsp; ✓ Op til 10.000 kontakter &nbsp;·&nbsp; ✓ Live statistik &nbsp;·&nbsp; ✓ 6 måneders varighed</div>
+      </div>
+
+      <!-- Credit pakker -->
+      <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;letter-spacing:-.02em;margin:8px 0 2px;text-align:center;">Credit pakker</div>
+      <div style="font-size:11px;color:var(--tx2);text-align:center;margin-bottom:8px;">Betal kun for det du sender · ingen binding</div>
+      <div class="pkg">
+        <div class="pkg-name">Starter</div>
+        <div class="pkg-price">400 kr.</div>
+        <div class="pkg-period">100 SMS-credits</div>
+        <div class="pkg-features">
+          <div class="pkg-feat">1 credit = 1 SMS (160 tegn)</div>
+          <div class="pkg-feat">Afsendernavn</div>
+          <div class="pkg-feat">Kontakt-import</div>
+        </div>
+        <button class="btn btn-ghost btn-full btn-sm" style="margin-top:10px;" onclick="openBtcModal('starter','Starter — 100 credits','400 DKK')">Betal nu 🔐</button>
+      </div>
+      <div class="pkg popular" style="margin-top:10px;">
+        <div class="pkg-badge">⭐ Mest populær</div>
+        <div class="pkg-name">Business</div>
+        <div class="pkg-price">900 kr.</div>
+        <div class="pkg-period">250 SMS-credits</div>
+        <div class="pkg-features">
+          <div class="pkg-feat">1 credit = 1 SMS (160 tegn)</div>
+          <div class="pkg-feat">Afsendernavn</div>
+          <div class="pkg-feat">Kontakt-import</div>
+          <div class="pkg-feat">Prioritet support</div>
+        </div>
+        <button class="btn btn-blue btn-full btn-sm" style="margin-top:10px;" onclick="openBtcModal('business','Business — 250 credits','900 DKK')">Betal nu 🔐</button>
+      </div>
+      <div class="pkg" style="margin-top:10px;">
+        <div class="pkg-name">Pro</div>
+        <div class="pkg-price">1.750 kr.</div>
+        <div class="pkg-period">500 SMS-credits</div>
+        <div class="pkg-features">
+          <div class="pkg-feat">1 credit = 1 SMS (160 tegn)</div>
+          <div class="pkg-feat">Afsendernavn</div>
+          <div class="pkg-feat">Kontakt-import</div>
+          <div class="pkg-feat">API-adgang</div>
+        </div>
+        <button class="btn btn-ghost btn-full btn-sm" style="margin-top:10px;" onclick="openBtcModal('pro','Pro — 500 credits','1750 DKK')">Betal nu 🔐</button>
+      </div>
+      </div>
+    </div>
+
+    <div style="text-align:center;padding:0 20px calc(16px + env(safe-area-inset-bottom,0px));font-size:10px;color:var(--tx3);line-height:1.7;">
+      MSGFLOW · Professionel SMS-platform<br>
+      <span style="color:var(--tx3);">Drevet af verdens bedste SMS-gateways</span>
+    </div>
+  </div>
+</div>
+
+<!-- ══ LOGIN SCREEN ══ -->
+<div class="screen" id="screen-login">
+  <div class="auth-wrap">
+    <div class="auth-logo"><span style="background:linear-gradient(135deg,#9fe870,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">MSG</span><span style="-webkit-text-fill-color:#fff;">FLOW</span></div>
+    <div class="auth-sub">Log ind på din konto</div>
+
+    <!-- Subscription notice -->
+    <div style="background:rgba(159,232,112,.08);border:1px solid rgba(159,232,112,.2);border-radius:12px;padding:12px 14px;width:100%;max-width:380px;margin-bottom:4px;">
+      <div style="font-size:12px;font-weight:600;color:var(--blue);margin-bottom:4px;">📋 Subscription påkrævet</div>
+      <div style="font-size:11px;color:var(--tx2);line-height:1.6;">Du skal have et aktivt abonnement for at bruge platformen. Subscription giver adgang til bulk SMS senderen — credits til afsendelse købes separat og er langt billigere end de fleste konkurrenter.</div>
+    </div>
+    <div class="auth-card">
+      <div class="field">
+        <label class="lbl">Email</label>
+        <input id="loginEmail" type="email" placeholder="din@email.dk" autocomplete="email">
+      </div>
+      <div class="field">
+        <label class="lbl">Adgangskode</label>
+        <div class="frow">
+          <input id="loginPass" type="password" placeholder="••••••••" autocomplete="current-password">
+          <button class="btn btn-ghost btn-sm" onclick="togglePass('loginPass',this)" style="flex-shrink:0;">Vis</button>
+        </div>
+      </div>
+      <div id="loginErr" style="font-size:11px;color:var(--err);display:none;text-align:center;"></div>
+      <button class="btn btn-blue btn-full" id="loginBtn" onclick="doLogin()">Log ind</button>
+      <button style="background:none;border:none;font-size:11px;color:var(--tx3);cursor:pointer;font-family:'DM Mono',monospace;text-align:center;" onclick="showScreen('screen-landing')">← Tilbage</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ APP SCREENS ══ -->
+<div class="screen" id="screen-app">
+  <nav class="nav">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <!-- Hamburger menu knap -->
+      <button id="menuBtn" onclick="toggleMenu()" style="background:none;border:none;cursor:pointer;padding:4px;display:flex;flex-direction:column;gap:4px;justify-content:center;" aria-label="Menu">
+        <span id="menuBar1" style="display:block;width:20px;height:2px;background:var(--tx2);border-radius:2px;transition:all .25s;"></span>
+        <span id="menuBar2" style="display:block;width:20px;height:2px;background:var(--tx2);border-radius:2px;transition:all .25s;"></span>
+        <span id="menuBar3" style="display:block;width:20px;height:2px;background:var(--tx2);border-radius:2px;transition:all .25s;"></span>
+      </button>
+      <div class="nav-brand" style="cursor:pointer;" onclick="switchTab('home')">MSG<span>FLOW</span></div>
+    </div>
+    <div class="nav-right">
+      <div class="nav-bal" id="balBadge">
+        <span id="balText">— Credits</span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- DROPDOWN MENU -->
+  <div id="appMenu" style="display:none;position:absolute;top:54px;left:0;z-index:200;width:220px;background:rgba(22,51,0,.98);border:1px solid rgba(159,232,112,.15);border-radius:0 0 16px 0;box-shadow:0 8px 32px rgba(0,0,0,.5);overflow:hidden;animation:slideDown .2s ease;">
+    <div style="padding:8px 0;">
+      <div style="font-size:9px;font-weight:700;letter-spacing:.12em;color:var(--tx3);padding:8px 16px 4px;text-transform:uppercase;">Navigation</div>
+      <button onclick="menuNav('home')" class="menu-item">🏠 Hjem</button>
+      <button onclick="menuNav('send')" class="menu-item">📤 Send SMS</button>
+      <button onclick="menuNav('contacts')" class="menu-item">👥 Kontakter</button>
+      <button onclick="menuNav('log')" class="menu-item">📋 Aktivitetslog</button>
+      <div id="adminMenuSection" style="display:none;">
+        <div style="height:1px;background:var(--bd);margin:6px 0;"></div>
+        <div style="font-size:9px;font-weight:700;letter-spacing:.12em;color:var(--tx3);padding:4px 16px;text-transform:uppercase;">Admin</div>
+        <button onclick="menuNav('voip')" class="menu-item">📞 VoIP Opkald</button>
+        <button onclick="menuNav('settings')" class="menu-item">⚙️ Indstillinger</button>
+        <button onclick="menuNav('admin')" class="menu-item">🛡️ Admin Panel</button>
+      </div>
+      <div style="height:1px;background:var(--bd);margin:6px 0;"></div>
+      <button onclick="doLogout();closeMenu();" class="menu-item" style="color:var(--err);">🚪 Log ud</button>
+    </div>
+  </div>
+  <div id="menuOverlay" onclick="closeMenu()" style="display:none;position:fixed;inset:0;z-index:199;"></div>
+
+  <!-- HOME TAB -->
+  <div class="screen active" id="tab-home">
+    <div class="scroll">
+
+      <!-- Hero — samme som landing -->
+      <div style="text-align:center;padding:20px 0 4px;">
+        <div class="hero-badge" style="margin-bottom:16px;">● SMS PLATFORM</div>
+        <div style="width:68px;height:68px;border-radius:20px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-size:30px;margin:0 auto 16px;box-shadow:0 8px 28px var(--glow);animation:float 3s ease-in-out infinite;">💬</div>
+        <div class="hero-title" style="font-size:clamp(26px,7vw,34px);margin-bottom:10px;">Send SMS til<br><span class="grad">10.000 kunder</span><br>på sekunder</div>
+        <div class="hero-sub" style="margin-bottom:18px;">Professionel bulk-SMS til din virksomhed. Betal kun for det du bruger.</div>
+      </div>
+
+      <!-- Stats -->
+      <div class="hero-stats">
+        <div class="stat"><div class="stat-n" id="homeCredits">—</div><div class="stat-l">Credits</div></div>
+        <div class="stat"><div class="stat-n" id="homeContacts">0</div><div class="stat-l">Kontakter</div></div>
+        <div class="stat"><div class="stat-n">⚡</div><div class="stat-l">Lynhurtig</div></div>
+      </div>
+
+      <!-- WhatsApp support banner -->
+      <a href="https://wa.me/447451296037" target="_blank" rel="noreferrer" id="waInApp" style="display:flex;align-items:center;gap:12px;background:rgba(37,211,102,.08);border:1px solid rgba(37,211,102,.2);border-radius:14px;padding:12px 16px;text-decoration:none;">
+        <div style="width:34px;height:34px;border-radius:50%;background:#25D366;display:grid;place-items:center;flex-shrink:0;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+        </div>
+        <div style="flex:1;">
+          <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;color:#9fe870;margin-bottom:2px;">Support via WhatsApp</div>
+          <div style="font-size:11px;color:var(--tx2);">Kontakt os direkte for hjælp</div>
+        </div>
+        <svg style="width:16px;height:16px;stroke:#9fe870;fill:none;stroke-width:2;opacity:.6" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+      </a>
+
+      <!-- PWA install banner -->
+      <div id="pwaBannerInApp" style="display:flex;align-items:center;gap:10px;background:rgba(22,51,0,.95);border:1px solid rgba(159,232,112,.2);border-radius:10px;padding:10px 12px;">
+        <svg style="width:16px;height:16px;stroke:#9fe870;fill:none;stroke-width:2;flex-shrink:0;" viewBox="0 0 24 24"><path d="M12 2v13m0 0l-4-4m4 4l4-4M3 18v1a2 2 0 002 2h14a2 2 0 002-2v-1"/></svg>
+        <div style="flex:1;font-size:11px;color:var(--tx2);line-height:1.5;">Tryk <strong style="color:#9fe870;">Del ↑</strong> → <strong style="color:#9fe870;">Føj til hjemmeskærm</strong> for fuld app-oplevelse</div>
+        <button onclick="document.getElementById('pwaBannerInApp').style.display='none';" style="background:none;border:none;color:var(--tx3);font-size:14px;cursor:pointer;padding:2px 4px;flex-shrink:0;">✕</button>
+      </div>
+
+      <!-- Send knap -->
+      <button class="btn btn-blue btn-full" style="font-size:16px;padding:15px;" onclick="switchTab('send')">
+        📤 Send dine beskeder her
+      </button>
+
+      <!-- Feature kort -->
+      <div class="card"><div class="cb" style="display:flex;gap:12px;align-items:center;">
+        <div style="width:38px;height:38px;border-radius:10px;background:rgba(96,165,250,.12);display:grid;place-items:center;flex-shrink:0;font-size:17px;">📱</div>
+        <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;margin-bottom:2px;">Importer kontakter</div><div style="font-size:11px;color:var(--tx2);line-height:1.5;">Send til op til 10.000 kontakter på én gang.</div></div>
+      </div></div>
+      <div class="card"><div class="cb" style="display:flex;gap:12px;align-items:center;">
+        <div style="width:38px;height:38px;border-radius:10px;background:rgba(103,232,249,.12);display:grid;place-items:center;flex-shrink:0;font-size:17px;">📊</div>
+        <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;margin-bottom:2px;">Live aktivitetslog</div><div style="font-size:11px;color:var(--tx2);line-height:1.5;">Følg afsendelse i realtid med detaljeret log.</div></div>
+      </div></div>
+      <div class="card"><div class="cb" style="display:flex;gap:12px;align-items:center;">
+        <div style="width:38px;height:38px;border-radius:10px;background:rgba(110,231,183,.12);display:grid;place-items:center;flex-shrink:0;font-size:17px;">💰</div>
+        <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px;margin-bottom:2px;">Credits tilbage</div><div style="font-size:11px;color:var(--tx2);line-height:1.5;">Se altid din aktuelle saldo øverst i appen.</div></div>
+      </div></div>
+
+      <!-- Priser -->
+      <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;letter-spacing:-.02em;margin:8px 0 6px;text-align:center;">Priser & Credits</div>
+
+      <!-- Subscription -->
+      <div style="background:linear-gradient(135deg,rgba(96,165,250,.1),rgba(103,232,249,.05));border:1px solid rgba(96,165,250,.3);border-radius:14px;padding:14px;">
+        <div style="font-family:'Syne',sans-serif;font-size:14px;font-weight:800;margin-bottom:4px;">📋 Subscription</div>
+        <div style="font-size:11px;color:var(--tx2);line-height:1.6;margin-bottom:10px;">Giver adgang til platformen i 6 måneder. Credits købes separat.</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:var(--blue);">900 kr.</div>
+            <div style="font-size:10px;color:var(--tx3);">6 måneder</div>
+          </div>
+          <button class="btn btn-blue btn-sm" onclick="openBtcModal('subscription','900 kr. — 6 mdr. subscription','900 DKK')">Betal nu 🔐</button>
+        </div>
+      </div>
+
+      <!-- Credit pakker -->
+      <div class="pkg">
+        <div class="pkg-name">Starter</div>
+        <div class="pkg-price">400 kr.</div>
+        <div class="pkg-period">100 SMS-credits</div>
+        <div class="pkg-features">
+          <div class="pkg-feat">1 credit = 1 SMS (160 tegn)</div>
+          <div class="pkg-feat">Afsendernavn</div>
+          <div class="pkg-feat">Kontakt-import</div>
+        </div>
+        <button class="btn btn-ghost btn-full btn-sm" style="margin-top:8px;" onclick="openBtcModal('starter','Starter — 100 credits','400 DKK')">Betal nu 🔐</button>
+      </div>
+      <div class="pkg popular" style="margin-top:10px;">
+        <div class="pkg-badge">⭐ Mest populær</div>
+        <div class="pkg-name">Business</div>
+        <div class="pkg-price">900 kr.</div>
+        <div class="pkg-period">250 SMS-credits</div>
+        <div class="pkg-features">
+          <div class="pkg-feat">1 credit = 1 SMS (160 tegn)</div>
+          <div class="pkg-feat">Afsendernavn</div>
+          <div class="pkg-feat">Kontakt-import</div>
+          <div class="pkg-feat">Prioritet support</div>
+        </div>
+        <button class="btn btn-blue btn-full btn-sm" style="margin-top:8px;" onclick="openBtcModal('business','Business — 250 credits','900 DKK')">Betal nu 🔐</button>
+      </div>
+      <div class="pkg" style="margin-top:10px;">
+        <div class="pkg-name">Pro</div>
+        <div class="pkg-price">1.750 kr.</div>
+        <div class="pkg-period">500 SMS-credits</div>
+        <div class="pkg-features">
+          <div class="pkg-feat">1 credit = 1 SMS (160 tegn)</div>
+          <div class="pkg-feat">Afsendernavn</div>
+          <div class="pkg-feat">Kontakt-import</div>
+          <div class="pkg-feat">API-adgang</div>
+        </div>
+        <button class="btn btn-ghost btn-full btn-sm" style="margin-top:8px;" onclick="openBtcModal('pro','Pro — 500 credits','1750 DKK')">Betal nu 🔐</button>
+      </div>
+
+      <div style="text-align:center;font-size:10px;color:var(--tx3);padding:12px 0 4px;letter-spacing:.1em;">CODED BY SKIMZY</div>
+    </div>
+  </div>
+
+  <!-- SEND TAB -->
+  <div class="screen" id="tab-send">
+    <div class="scroll" id="scroll-send">
+
+      <!-- SMS Gateway status -->
+      <div id="smsGatewayBar" style="background:rgba(159,232,112,.07);border:1px solid rgba(159,232,112,.2);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:10px;">
+        <div id="smsGwDot" style="width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;"></div>
+        <div style="flex:1;">
+          <div id="smsGwTxt" style="font-size:12px;font-weight:700;color:var(--ok);">Gateway klar</div>
+          <div id="smsGwSub" style="font-size:10px;color:var(--tx3);">Klar til SMS</div>
+        </div>
+      </div>
+
+      <div id="warnBanner" style="display:none;background:rgba(245,158,11,.05);border:1px solid rgba(245,158,11,.2);border-radius:12px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" style="flex-shrink:0;margin-top:1px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <div style="font-size:11px;color:var(--warn);line-height:1.5;"><strong>Opsætning mangler.</strong> Gå til Indstillinger og konfigurér din SMS-gateway.</div>
+      </div>
+
+      <div class="card">
+        <div class="ch">Besked</div>
+        <div class="cb" style="display:flex;flex-direction:column;gap:12px;">
+          <div class="field">
+            <label class="lbl">Afsendernavn (maks 11 tegn)</label>
+            <input id="senderName" maxlength="11" placeholder="DinVirksomhed" oninput="updateUI()">
+            <div class="meta-row"><span id="senderCount">0/11</span><span id="statusDot" style="color:var(--ok);">● Online</span></div>
+          </div>
+          <div class="field">
+            <label class="lbl">Beskedtekst (maks 3000 tegn)</label>
+            <textarea id="message" rows="6" placeholder="Skriv din SMS her…" oninput="updateUI()" style="min-height:120px;"></textarea>
+            <div class="meta-row"><span id="charCount">0 tegn</span><span id="smsCount">0 credits pr. kontakt</span></div>
+          </div>
+          <div style="background:rgba(251,191,36,.06);border:1px solid rgba(251,191,36,.2);border-radius:10px;padding:11px 13px;display:flex;gap:9px;align-items:flex-start;">
+            <span style="font-size:14px;flex-shrink:0;">⚠️</span>
+            <div style="font-size:10.5px;color:var(--warn);line-height:1.6;">
+              For at sikre korrekt levering må beskeder og afsendernavn <strong>ikke</strong> indeholde emojis eller bogstaverne <strong>Æ, Ø og Å</strong>. Disse tegn forhindrer virksomhedens SMS'er i at blive leveret korrekt. Tak for forståelsen.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="ch">Modtagere</div>
+        <div class="cb">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+            <div>
+              <div style="font-family:'Syne',sans-serif;font-size:28px;font-weight:800;letter-spacing:-.02em;color:var(--blue);" id="recipCount">0</div>
+              <div style="font-size:10px;color:var(--tx3);margin-top:1px;">kontakter klar</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="switchTab('contacts')">Administrér →</button>
+          </div>
+          <div id="recipPreview" class="hint" style="display:none;"></div>
+        </div>
+      </div>
+
+      <div class="card" id="progressCard" style="display:none;">
+        <div class="ch">Afsendelse</div>
+        <div class="cb">
+          <div class="prog-wrap">
+            <div class="prog-nums">
+              <span class="c-ok" id="pSent">✓ 0</span>
+              <span style="color:var(--tx2);" id="pPct">0%</span>
+              <span class="c-err" id="pFailed">✗ 0</span>
+            </div>
+            <div class="prog-track"><div class="prog-bar-fill" id="progFill"></div></div>
+            <div style="text-align:center;font-size:10px;color:var(--tx3);margin-top:6px;" id="pSub">0 / 0</div>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-blue btn-full" id="sendBtn" onclick="doSend()" disabled style="font-size:16px;padding:15px;margin-top:4px;">Send til 0 kontakter</button>
+
+    </div>
+  </div>
+
+  <!-- CONTACTS TAB -->
+  <div class="screen" id="tab-contacts">
+    <div class="scroll">
+      <div class="card">
+        <div class="ch">Importer</div>
+        <div class="cb" style="display:flex;flex-direction:column;gap:8px;">
+          <div class="import-card" onclick="document.getElementById('vcfFile').click()">
+            <div class="import-ico" style="background:rgba(6,182,212,.1);">📱</div>
+            <div style="flex:1;min-width:0;"><div style="font-size:13px;font-weight:600;margin-bottom:2px;">iPhone & Android (.vcf)</div><div style="font-size:11px;color:var(--tx2);">Eksportér kontakter som vCard</div></div>
+            <span style="color:var(--tx3);font-size:18px;">›</span>
+          </div>
+          <input type="file" id="vcfFile" accept=".vcf,.vcard" style="display:none" onchange="importVCF(this)">
+          <div class="import-card" onclick="document.getElementById('csvFile').click()">
+            <div class="import-ico" style="background:rgba(16,185,129,.1);">📊</div>
+            <div style="flex:1;min-width:0;"><div style="font-size:13px;font-weight:600;margin-bottom:2px;">CSV / Excel</div><div style="font-size:11px;color:var(--tx2);">Upload .csv med telefonnumre</div></div>
+            <span style="color:var(--tx3);font-size:18px;">›</span>
+          </div>
+          <input type="file" id="csvFile" accept=".csv,.txt" style="display:none" onchange="importCSV(this)">
+          <div class="import-card" onclick="openManual()">
+            <div class="import-ico" style="background:rgba(251,191,36,.1);">✏️</div>
+            <div style="flex:1;min-width:0;"><div style="font-size:13px;font-weight:600;margin-bottom:2px;">Skriv manuelt</div><div style="font-size:11px;color:var(--tx2);">Indsæt numre direkte</div></div>
+            <span style="color:var(--tx3);font-size:18px;">›</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="ctCard" class="card" style="display:none;">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px 0;">
+          <span style="font-size:9px;font-weight:700;letter-spacing:.15em;color:var(--tx3);text-transform:uppercase;" id="ctTitle">Kontakter</span>
+          <button onclick="clearAll()" style="background:none;border:none;color:var(--err);font-size:11px;font-weight:600;cursor:pointer;font-family:'DM Mono',monospace;">Ryd alle</button>
+        </div>
+        <div style="padding:10px 16px;border-bottom:1px solid var(--bd);">
+          <input id="ctSearch" placeholder="Søg navn eller nummer…" oninput="renderCtList()" style="font-size:13px;">
+        </div>
+        <div class="cb"><div style="display:flex;flex-direction:column;gap:5px;" id="ctList"></div></div>
+      </div>
+
+      <div class="empty" id="ctEmpty">
+        <div class="empty-ico">👥</div>
+        <div class="empty-t">Ingen kontakter</div>
+        <div class="empty-d">Importer fra telefon eller tilføj manuelt</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS TAB -->
+  <div class="screen" id="tab-settings">
+    <div class="scroll" id="scroll-settings">
+
+
+      <div class="card">
+        <div class="ch">Konto</div>
+        <div class="cb">
+          <div style="display:flex;align-items:center;gap:12px;padding:4px 0 14px;border-bottom:1px solid var(--bd);margin-bottom:14px;">
+            <div style="width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-family:'Syne',sans-serif;font-size:16px;font-weight:800;flex-shrink:0;" id="settingsAvatar">?</div>
+            <div><div style="font-size:14px;font-weight:600;" id="settingsName">—</div><div style="font-size:11px;color:var(--tx3);" id="settingsEmail">—</div></div>
+          </div>
+
+          <!-- Subscription status — kun for normale brugere -->
+          <div id="subStatusBox" style="display:none;border-radius:10px;padding:12px 14px;margin-bottom:14px;border:1px solid;">
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+              <div style="font-size:12px;font-weight:700;" id="subStatusTxt">Subscription</div>
+              <div style="font-size:11px;" id="subDaysChip"></div>
+            </div>
+            <div style="font-size:11px;color:var(--tx3);margin-top:4px;" id="subStatusSub"></div>
+          </div>
+
+          <button class="btn btn-full" style="background:rgba(239,68,68,.08);color:var(--err);border:1px solid rgba(239,68,68,.15);" onclick="doLogout()">Log ud</button>
+        </div>
+      </div>
+
+      <!-- KUN SYNLIG FOR ADMIN -->
+      <div id="adminUserCard" style="display:none;">
+        <!-- Opret ny bruger -->
+        <div style="font-size:9px;font-weight:700;letter-spacing:.15em;color:var(--tx3);text-transform:uppercase;margin-bottom:8px;">Opret ny bruger</div>
+        <div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px;margin-bottom:14px;">
+          <div class="field">
+            <label class="lbl">Email</label>
+            <input id="newUserEmail" type="email" placeholder="firma@email.dk">
+          </div>
+          <div class="field">
+            <label class="lbl">Adgangskode</label>
+            <input id="newUserPass" type="password" placeholder="Min. 6 tegn">
+          </div>
+          <div class="field">
+            <label class="lbl">Navn / Virksomhed</label>
+            <input id="newUserName" type="text" placeholder="Firmanavn">
+          </div>
+          <div class="field">
+            <label class="lbl">Start credits</label>
+            <input id="newUserCredits" type="number" inputmode="numeric" placeholder="f.eks. 100" value="0">
+          </div>
+          <div id="createUserStatus" style="font-size:11px;display:none;text-align:center;"></div>
+          <button class="btn btn-blue btn-full" onclick="adminCreateUser()">Opret bruger ➕</button>
+        </div>
+
+        <!-- Eksisterende brugere -->
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+          <span style="font-size:9px;font-weight:700;letter-spacing:.15em;color:var(--tx3);text-transform:uppercase;">Alle brugere (Database)</span>
+          <button onclick="adminLoadUsers()" style="background:none;border:none;color:var(--blue);font-size:11px;font-weight:600;cursor:pointer;font-family:'DM Mono',monospace;">Hent ↻</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;" id="adminUserList">
+          <div style="font-size:11px;color:var(--tx3);text-align:center;padding:12px 0;background:var(--s1);border:1px solid var(--bd);border-radius:12px;" id="adminUserEmpty">
+            Tryk "Hent ↻" for at se alle brugere.
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- LOG TAB -->
+  <div class="screen" id="tab-log">
+    <div class="scroll">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:9px;font-weight:700;letter-spacing:.15em;color:var(--tx3);text-transform:uppercase;">Aktivitetslog</span>
+        <button onclick="clearLog()" style="background:none;border:none;color:var(--err);font-size:11px;font-weight:600;cursor:pointer;font-family:'DM Mono',monospace;">Ryd</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px;" id="logList">
+        <div class="empty" id="logEmpty">
+          <div class="empty-ico">📋</div>
+          <div class="empty-t">Ingen aktivitet</div>
+          <div class="empty-d">Log vises her under afsendelse</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ADMIN TAB -->
+  <div class="screen" id="tab-admin">
+    <div class="scroll">
+      <div style="background:linear-gradient(135deg,rgba(96,165,250,.12),rgba(103,232,249,.06));border:1px solid rgba(96,165,250,.3);border-radius:14px;padding:12px 14px;display:flex;gap:12px;align-items:center;">
+        <div style="font-size:22px;">🛡️</div>
+        <div>
+          <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;color:var(--blue);">Admin Panel</div>
+          <div style="font-size:11px;color:var(--tx3);">Kun synlig for dig</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div class="dash-card">
+          <div class="dash-n" style="color:var(--blue);font-size:20px;" id="adminCredits">—</div>
+          <div class="dash-l">Credits</div>
+        </div>
+        <div class="dash-card">
+          <div class="dash-n" style="color:var(--ok);font-size:20px;" id="adminContacts">0</div>
+          <div class="dash-l">Kontakter</div>
+        </div>
+      </div>
+
+      <!-- Admin konto info -->
+      <div class="card">
+        <div class="ch">Admin konto</div>
+        <div class="cb" style="display:flex;flex-direction:column;gap:6px;">
+          <div style="display:flex;justify-content:space-between;font-size:12px;padding:6px 0;border-bottom:1px solid var(--bd);">
+            <span style="color:var(--tx3);">Email</span>
+            <span style="color:var(--cyan);">admin@msgflow.dk</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;padding:6px 0;">
+            <span style="color:var(--tx3);">Adgangskode</span>
+            <span style="color:var(--tx2);">Skimzy2024!</span>
+          </div>
+        </div>
+      </div>
+
+
+
+
+    </div>
+  </div>
+
+  <!-- VOIP TAB -->
+  <div class="screen" id="tab-voip">
+    <div class="scroll">
+
+      <!-- Status bar -->
+      <div id="sipStatus" style="display:none;font-size:11px;padding:8px 12px;border-radius:8px;margin-bottom:8px;"></div>
+      <div id="voipStatusBar" style="background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div id="voipStatusDot" style="width:8px;height:8px;border-radius:50%;background:var(--err);"></div>
+          <span id="voipStatusTxt" style="font-size:12px;color:var(--err);">Ikke tilsluttet</span>
+        </div>
+        <span style="font-size:10px;color:var(--tx3);" id="voipGateway">Tilslutter...</span>
+      </div>
+
+      <!-- Aktiv opkald display -->
+      <div id="voipCallDisplay" style="display:none;background:linear-gradient(135deg,rgba(96,165,250,.1),rgba(103,232,249,.05));border:1px solid rgba(96,165,250,.3);border-radius:16px;padding:24px 16px;text-align:center;">
+        <div style="font-size:11px;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px;" id="voipCallState">Ringer…</div>
+        <div style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;margin-bottom:4px;" id="voipCallNumber">+45 00 00 00 00</div>
+        <div style="font-size:12px;color:var(--tx2);margin-bottom:16px;" id="voipCallDuration">00:00</div>
+        <!-- Opkalds-knapper -->
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;max-width:240px;margin:0 auto 16px;">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:6px;">
+            <button id="muteBtn" onclick="toggleMute()" style="width:52px;height:52px;border-radius:50%;background:var(--s2);border:1px solid var(--bd);cursor:pointer;font-size:20px;display:grid;place-items:center;transition:all .2s;">🎤</button>
+            <span style="font-size:9px;color:var(--tx3);">Mute</span>
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:center;gap:6px;">
+            <button id="holdBtn" onclick="toggleHold()" style="width:52px;height:52px;border-radius:50%;background:var(--s2);border:1px solid var(--bd);cursor:pointer;font-size:20px;display:grid;place-items:center;transition:all .2s;">⏸</button>
+            <span style="font-size:9px;color:var(--tx3);">Hold</span>
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:center;gap:6px;">
+            <button id="speakerBtn" onclick="toggleSpeaker()" style="width:52px;height:52px;border-radius:50%;background:var(--s2);border:1px solid var(--bd);cursor:pointer;font-size:20px;display:grid;place-items:center;transition:all .2s;">🔈</button>
+            <span style="font-size:9px;color:var(--tx3);">Højttaler</span>
+          </div>
+        </div>
+        <!-- Læg på -->
+        <button onclick="hangUp()" style="width:64px;height:64px;border-radius:50%;background:var(--err);border:none;cursor:pointer;font-size:26px;display:grid;place-items:center;margin:0 auto;box-shadow:0 4px 20px rgba(239,68,68,.4);">📵</button>
+      </div>
+
+      <!-- Dialpad -->
+      <div id="voipDialpad" style="background:var(--s1);border:1px solid var(--bd);border-radius:16px;overflow:hidden;">
+        <div class="ch" style="padding:14px 16px 10px;">Dialpad</div>
+        <div style="padding:0 16px 16px;">
+
+          <!-- Firma nummer — redigérbart -->
+          <div style="background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:10px 14px;margin-bottom:12px;">
+            <div style="font-size:10px;color:var(--tx3);margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+              <span>🏢</span> Nummer der vises hos dine kunder
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input id="callerNumber"
+                style="flex:1;font-size:15px;font-weight:600;color:var(--blue);background:transparent;border:none;outline:none;font-family:'DM Mono',monospace;padding:0;"
+                oninput="saveBusinessNum(this.value)"
+                placeholder="+45 XX XX XX XX">
+              <span style="font-size:11px;color:var(--ok);" id="numSaved"></span>
+            </div>
+          </div>
+
+          <!-- Nummer display -->
+          <div style="background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:12px 14px;margin-bottom:12px;">
+            <div style="font-size:10px;color:var(--tx2);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;">
+              <span>Skriv eller indsæt nummeret du vil ringe op</span>
+              <button onclick="dialPaste()" style="background:rgba(159,232,112,.12);border:1px solid rgba(159,232,112,.25);border-radius:6px;cursor:pointer;color:var(--blue);font-size:10px;font-family:'DM Mono',monospace;font-weight:600;padding:3px 8px;-webkit-appearance:none;">Indsæt</button>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+              <div style="font-family:'Syne',sans-serif;font-size:24px;font-weight:700;letter-spacing:.1em;min-height:34px;flex:1;text-align:center;" id="dialDisplay">+45</div>
+              <button onclick="dialDelete()" style="background:none;border:none;cursor:pointer;color:var(--tx3);font-size:20px;">⌫</button>
+            </div>
+          </div>
+
+          <!-- Numre -->
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+            <button onclick="dialPress('1')" class="dial-key">1<span></span></button>
+            <button onclick="dialPress('2')" class="dial-key">2<span>ABC</span></button>
+            <button onclick="dialPress('3')" class="dial-key">3<span>DEF</span></button>
+            <button onclick="dialPress('4')" class="dial-key">4<span>GHI</span></button>
+            <button onclick="dialPress('5')" class="dial-key">5<span>JKL</span></button>
+            <button onclick="dialPress('6')" class="dial-key">6<span>MNO</span></button>
+            <button onclick="dialPress('7')" class="dial-key">7<span>PQRS</span></button>
+            <button onclick="dialPress('8')" class="dial-key">8<span>TUV</span></button>
+            <button onclick="dialPress('9')" class="dial-key">9<span>WXYZ</span></button>
+            <button onclick="dialPress('*')" class="dial-key">*<span></span></button>
+            <button onclick="dialPress('0')" class="dial-key">0<span>+</span></button>
+            <button onclick="dialPress('#')" class="dial-key">#<span></span></button>
+          </div>
+
+          <!-- Ring knap -->
+          <button onclick="makeCall()" id="callBtn" style="width:100%;height:56px;border-radius:99px;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;border:none;cursor:pointer;font-size:20px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:10px;box-shadow:0 4px 20px rgba(22,163,74,.4);font-family:'Syne',sans-serif;">
+            📞 Ring op
+          </button>
+        </div>
+      </div>
+
+      
+
+      <!-- Opkaldslog -->
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px 0;">
+          <span style="font-size:9px;font-weight:700;letter-spacing:.15em;color:var(--tx3);text-transform:uppercase;">Opkaldslog</span>
+          <button onclick="clearCallLog()" style="background:none;border:none;color:var(--err);font-size:11px;cursor:pointer;font-family:'DM Mono',monospace;">Ryd</button>
+        </div>
+        <div class="cb">
+          <div style="display:flex;flex-direction:column;gap:4px;" id="callLogList">
+            <div class="empty" id="callLogEmpty">
+              <div class="empty-ico">📞</div>
+              <div class="empty-t">Ingen opkald endnu</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <nav class="bnav">
+    <button class="bn active" id="bn-home" onclick="switchTab('home')">
+      <svg viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>Hjem
+    </button>
+    <button class="bn" id="bn-send" onclick="switchTab('send')">
+      <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>Send
+    </button>
+    <button class="bn" id="bn-contacts" onclick="switchTab('contacts')">
+      <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>Kontakter
+    </button>
+    <button class="bn" id="bn-settings" onclick="switchTab('settings')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Indstillinger
+    </button>
+    <button class="bn" id="bn-log" onclick="switchTab('log')">
+      <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>Log
+    </button>
+    <button class="bn" id="bn-admin" onclick="switchTab('admin')" style="display:none;">
+      <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Admin
+    </button>
+  </nav>
+</div>
+
+<!-- MANUAL MODAL -->
+<div class="modal-bg" id="manualModal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Tilføj numre manuelt</div>
+    <div class="modal-sub">Ét nummer pr. linje · +45, 0045 eller 8 cifre</div>
+    <div class="field" style="margin-bottom:12px;">
+      <textarea id="manualTa" rows="8" placeholder="+4512345678&#10;+4587654321&#10;12345678&#10;…" oninput="manualCount()"></textarea>
+      <div class="hint" id="manualHint">0 numre fundet</div>
+    </div>
+    <div class="frow">
+      <button class="btn btn-blue btn-full" onclick="saveManual()">Tilføj</button>
+      <button class="btn btn-ghost btn-sm" onclick="closeManual()">Annuller</button>
+    </div>
+  </div>
+</div>
+
+<!-- SENDING LOADER POPUP -->
+<div class="popup-bg" id="sendingPopup">
+  <div class="popup">
+    <div style="font-size:44px;margin-bottom:14px;animation:float 2s ease-in-out infinite;">📤</div>
+    <div class="popup-title" id="sendingTitle">Sender beskeder…</div>
+    <div style="font-size:12px;color:var(--tx2);margin-bottom:16px;" id="sendingSub">Vent venligst…</div>
+    <div style="background:var(--s2);border-radius:99px;height:4px;overflow:hidden;margin-bottom:8px;">
+      <div id="sendingBar" style="height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:99px;width:0%;transition:width .3s ease;"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--tx3);">
+      <span id="sendingPct">0%</span><span id="sendingStep">Forbereder…</span>
+    </div>
+    <div style="display:flex;justify-content:center;gap:5px;margin-top:14px;">
+      <div style="width:7px;height:7px;border-radius:50%;background:var(--blue);animation:pulse 1s ease infinite;"></div>
+      <div style="width:7px;height:7px;border-radius:50%;background:var(--cyan);animation:pulse 1s ease .15s infinite;"></div>
+      <div style="width:7px;height:7px;border-radius:50%;background:var(--blue);animation:pulse 1s ease .3s infinite;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- SUCCESS POPUP -->
+<div class="popup-bg" id="successPopup">
+  <div class="popup">
+    <canvas id="confetti" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;border-radius:24px;"></canvas>
+    <div class="popup-ico">🎉</div>
+    <div class="popup-title">Sådan!</div>
+    <div style="font-size:12px;color:var(--tx2);margin-bottom:14px;" id="successSub">Dine beskeder er sendt!</div>
+    <div class="popup-stats">
+      <div class="pstat"><div class="pstat-n c-ok" id="popSent">0</div><div class="pstat-l">✓ SENDT</div></div>
+      <div class="pstat"><div class="pstat-n c-err" id="popFailed">0</div><div class="pstat-l">✗ FEJL</div></div>
+    </div>
+    <div class="popup-credits">
+      <div class="popup-cred-n" id="popCredits">—</div>
+      <div class="popup-cred-l">Credits tilbage</div>
+    </div>
+    <button class="btn btn-blue btn-full" onclick="closeSuccess()">OK, super! 👍</button>
+  </div>
+</div>
+
+<!-- ERROR POPUP -->
+<div class="popup-bg" id="errorPopup">
+  <div class="popup" style="border-color:rgba(239,68,68,.2);">
+    <div class="popup-ico" style="animation:none;">⚠️</div>
+    <div class="popup-title" style="color:var(--err);">HOV!</div>
+    <div style="font-size:12px;color:var(--tx2);margin-bottom:14px;">Din besked blev ikke sendt — du er <strong style="color:var(--tx);">ikke debiteret</strong>.</div>
+    <div style="background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.15);border-radius:10px;padding:12px;margin-bottom:14px;font-size:12px;color:var(--err);" id="errMsg">Ukendt fejl</div>
+    <button class="btn btn-full" style="background:rgba(239,68,68,.08);color:var(--err);border:1px solid rgba(239,68,68,.2);" onclick="closeError()">Forstået</button>
+  </div>
+</div>
+
+<!-- WHATSAPP -->
+
+
+<!-- BTC BETALING MODAL -->
+<div class="modal-bg" id="btcModal">
+  <div class="modal">
+    <div onclick="closeBtcModal()" style="cursor:pointer;text-align:center;padding:4px 0 14px;"><div style="width:36px;height:4px;background:var(--bd2);border-radius:99px;margin:0 auto 10px;"></div><div style="font-size:10px;color:var(--tx3);letter-spacing:.08em;">TRYK FOR AT LUKKE</div></div>
+    <div class="modal-title">🔐 Betal med Bitcoin</div>
+    <div class="modal-sub" id="btcModalSub">Starter — 100 credits · 400 DKK</div>
+
+    <div style="background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:14px;text-align:center;margin-bottom:10px;">
+      <div style="font-size:10px;color:var(--tx3);margin-bottom:8px;letter-spacing:.05em;">SEND BITCOIN TIL DENNE ADRESSE</div>
+      <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--cyan);word-break:break-all;line-height:1.6;margin-bottom:6px;" id="btcAddress">Henter adresse…</div>
+      <div style="font-size:12px;color:var(--warn);font-weight:600;margin-bottom:10px;white-space:pre-line;line-height:1.6;" id="btcBtcAmount"></div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;">
+        <button class="btn btn-ghost btn-sm" onclick="copyBtc()" style="flex:1;" id="copyBtcBtn">Kopiér adresse</button>
+        <button class="btn btn-ghost btn-sm" onclick="copyBtcAmount()" style="flex:1;" id="copyAmountBtn">Kopiér beløb</button>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="fetchAndShowBtcRate(currentPackageId)" style="width:100%;font-size:11px;color:var(--tx3);">↻ Opdatér kurs nu</button>
+    </div>
+
+    <div id="btcConfirmStatus" style="display:none;text-align:center;padding:10px;background:var(--s2);border-radius:10px;font-size:12px;margin-bottom:10px;"></div>
+
+    <div style="background:rgba(251,191,36,.05);border:1px solid rgba(251,191,36,.2);border-radius:10px;padding:12px;margin-bottom:12px;">
+      <div style="font-size:11px;color:var(--warn);line-height:1.8;">
+        <strong>Sådan betaler du:</strong><br>
+        1. Kopiér BTC-adressen og send præcis beløbet<br>
+        2. Appen tjekker automatisk efter 3 bekræftelser<br>
+        3. Credits tilføjes automatisk til din konto 🎉<br>
+        4. Eller kontakt os på WhatsApp med dit transaktions-ID
+      </div>
+    </div>
+
+    <div style="font-size:10px;color:var(--tx3);text-align:center;margin-bottom:12px;">
+      Live BTC/DKK kurs: <a href="https://www.coinbase.com/converter/btc/dkk" target="_blank" style="color:var(--blue);text-decoration:none;">Coinbase →</a>
+    </div>
+
+    <div class="frow">
+      <button class="btn btn-cyan btn-full" onclick="window.open('https://wa.me/447451296037','_blank')">WhatsApp support</button>
+      <button class="btn btn-ghost btn-sm" onclick="closeBtcModal()" style="flex-shrink:0;">Luk</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── SUPABASE CONFIG ─────────────────────────────────────────────
+// Indsæt dine Supabase credentials her:
+const SUPABASE_URL = 'https://hqijqnkrdevesvqfizaj.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhxaWpxbmtyZGV2ZXN2cWZpemFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1MDU3NTUsImV4cCI6MjA5NjA4MTc1NX0.qF9u8Vws21aGVGBV93IqS9_aKitxmQjKP9azyFJlRFw';
+const SUPABASE_SERVICE_KEY_VAL = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhxaWpxbmtyZGV2ZXN2cWZpemFqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDUwNTc1NSwiZXhwIjoyMDk2MDgxNzU1fQ.gzeUoV-wYCbB2RQmBNz-bs6dCyHLy3gtJNeMXjTkVZY';
+
+const USE_SUPABASE = SUPABASE_URL !== '' && SUPABASE_KEY !== '';
+
+// ── ADMIN CREDENTIALS ──
+const ADMIN_EMAIL    = 'admin@msgflow.dk';
+const ADMIN_PASS     = 'Skimzy2024!';
+
+// ── TEST KONTO ──
+const TEST_EMAIL     = '123Sms@testersms.com';
+const TEST_PASS      = '123Sms';
+const TEST_CREDITS_DEFAULT = 1950;
+const TEST_CREDITS_CURRENT = 9;       // 1941 er allerede brugt
+const CREDITS_PER_CONTACT  = 3;
+
+let currentUser = null;
+let isAdmin    = false;
+let isTestUser = false;
+let userCredits = 0;
+let sbToken     = null;                // Supabase JWT for nuværende bruger
+
+// Én gang: sæt lokal test-balance til 9 hvis den stadig er på 1950
+(function migrateCreditBalance(){
+  const saved=localStorage.getItem('test_credits');
+  if(saved===null || parseInt(saved,10)===TEST_CREDITS_DEFAULT){
+    localStorage.setItem('test_credits', String(TEST_CREDITS_CURRENT));
+  }
+})();
+
+// ── LOKAL CREDIT STORAGE (bruges når Supabase ikke er sat op) ──
+function loadCredits(){
+  if(isAdmin){ userCredits=Infinity; return; }
+  if(isTestUser){
+    const saved=localStorage.getItem('test_credits');
+    userCredits = saved!==null ? parseInt(saved,10) : TEST_CREDITS_CURRENT;
+  } else {
+    // Supabase-bruger: hentes fra DB — starter på 0 indtil DB-kald returnerer
+    userCredits = 0;
+  }
+}
+function saveCredits(){
+  if(isTestUser) localStorage.setItem('test_credits', String(userCredits));
+  // Supabase-brugere: gemmes i deductCreditsDB()
+}
+
+// ── SUPABASE HELPERS ──
+async function sbGET(path, token){
+  const headers={'apikey':SUPABASE_KEY,'Content-Type':'application/json'};
+  if(token) headers['Authorization']='Bearer '+token;
+  const res=await fetch(SUPABASE_URL+path,{headers});
+  return res.json();
+}
+async function sbPATCH(path, body, token){
+  const headers={'apikey':SUPABASE_KEY,'Content-Type':'application/json','Prefer':'return=representation'};
+  if(token) headers['Authorization']='Bearer '+token;
+  const res=await fetch(SUPABASE_URL+path,{method:'PATCH',headers,body:JSON.stringify(body)});
+  return res.json();
+}
+async function sbPOST(path, body, token){
+  const headers={'apikey':SUPABASE_KEY,'Content-Type':'application/json'};
+  if(token) headers['Authorization']='Bearer '+token;
+  const res=await fetch(SUPABASE_URL+path,{method:'POST',headers,body:JSON.stringify(body)});
+  return res.json();
+}
+
+// Hent brugerens credits fra Supabase profiles-tabel
+async function fetchCreditsFromDB(){
+  if(!USE_SUPABASE||!sbToken) return;
+  try{
+    const d=await sbGET('/rest/v1/profiles?select=credits&id=eq.'+currentUser.id,sbToken);
+    if(Array.isArray(d)&&d.length>0&&d[0].credits!==undefined){
+      userCredits=d[0].credits;
+      refreshBalance(); updateHomeStats(); updateUI();
+    }
+  }catch(e){}
+}
+
+// Træk credits fra Supabase (kaldes efter afsendelse)
+async function deductCreditsDB(amount){
+  if(!USE_SUPABASE||!sbToken) return;
+  try{
+    await sbPATCH('/rest/v1/profiles?id=eq.'+currentUser.id,{credits:Math.max(0,userCredits)},sbToken);
+  }catch(e){}
+}
+
+// ── ADMIN: hent alle brugere fra DB ──
+// Admin bruger anon key direkte — lokal admin har ingen JWT
+function getAdminToken(){
+  return sbToken || SUPABASE_KEY;
+}
+
+async function adminFetchAllUsers(){
+  if(!USE_SUPABASE) return null;
+  try{
+    const d=await sbGET('/rest/v1/profiles?select=id,email,full_name,credits,is_admin,subscription_expires&order=created_at.asc', getAdminToken());
+    return Array.isArray(d)?d:null;
+  }catch(e){ return null; }
+}
+
+async function adminSetUserCredits(userId, credits){
+  if(!USE_SUPABASE) return false;
+  try{
+    await sbPATCH('/rest/v1/profiles?id=eq.'+userId,{credits}, getAdminToken());
+    return true;
+  }catch(e){ return false; }
+}
+
+// Simpel Supabase auth fetch (POST)
+async function sbFetch(endpoint, body, token){
+  const headers={'Content-Type':'application/json','apikey':SUPABASE_KEY};
+  if(token) headers['Authorization']='Bearer '+token;
+  // Admin-endpoints kræver service role
+  if(endpoint.includes('/admin/')) headers['Authorization']='Bearer '+SUPABASE_SERVICE_KEY_VAL;
+  const res=await fetch(SUPABASE_URL+endpoint,{method:'POST',headers,body:JSON.stringify(body)});
+  return res.json();
+}
+
+// Tjek lokal session
+
+function showPWAGuide(){
+  // Detekter iOS vs Android
+  var isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent);
+  var isAndroid=/Android/.test(navigator.userAgent);
+  var msg='';
+  if(isIOS){
+    msg='1. Tryk på Del-ikonet ↑ nederst i Safari\n2. Scroll ned og tryk "Føj til hjemmeskærm"\n3. Tryk "Tilføj" øverst til højre';
+  } else if(isAndroid){
+    msg='1. Tryk på menuen ⋮ øverst til højre i Chrome\n2. Tryk "Føj til startskærm"\n3. Tryk "Tilføj"';
+  } else {
+    msg='Åbn siden i Safari på din iPhone\nog tryk Del ↑ → Føj til hjemmeskærm';
+  }
+  alert(msg);
+}
+
+function checkSession(){
+  const s=localStorage.getItem('sb_session');
+  if(s){ try{
+    const j=JSON.parse(s);
+    if(j.user&&j.access_token){
+      currentUser={...j.user,access_token:j.access_token};
+      isAdmin=j.access_token==='admin';
+      isTestUser=j.access_token==='test';
+      if(!isAdmin&&!isTestUser) sbToken=j.access_token;
+      loadCredits();
+      openApp();
+      if(USE_SUPABASE&&sbToken) fetchCreditsFromDB();
+    }
+  }catch(e){} }
+}
+
+// ── AUTH ────────────────────────────────────────────────────────
+async function doLogin(){
+  const email=document.getElementById('loginEmail').value.trim();
+  const pass=document.getElementById('loginPass').value;
+  const err=document.getElementById('loginErr');
+  const btn=document.getElementById('loginBtn');
+  err.style.display='none';
+  if(!email||!pass){err.textContent='Udfyld email og adgangskode';err.style.display='block';return;}
+  btn.disabled=true; btn.textContent='Logger ind…';
+  try {
+    // Admin login — case sensitive på begge felter
+    if(email===ADMIN_EMAIL && pass===ADMIN_PASS){
+      isAdmin=true;
+      currentUser={email,user_metadata:{full_name:'Admin'}};
+      localStorage.setItem('sb_session',JSON.stringify({user:currentUser,access_token:'admin'}));
+      openApp(); btn.disabled=false; btn.textContent='Log ind'; return;
+    }
+    // Forkert admin email men admin-agtig → afvis tydeligt
+    if(email===ADMIN_EMAIL && pass!==ADMIN_PASS){
+      throw new Error('wrong');
+    }
+    // Test konto — case sensitive på begge felter
+    if(email===TEST_EMAIL && pass===TEST_PASS){
+      isTestUser=true; isAdmin=false;
+      // Log ind via Supabase for at få rigtig user ID
+      if(USE_SUPABASE){
+        try{
+          const d=await sbFetch('/auth/v1/token?grant_type=password',{email,password:pass});
+          if(d.access_token){
+            sbToken=d.access_token;
+            currentUser={...d.user,access_token:d.access_token};
+            localStorage.setItem('sb_session',JSON.stringify({user:d.user,access_token:d.access_token}));
+            // Hent credits fra DB
+            loadCredits();
+            openApp();
+            fetchCreditsFromDB();
+            btn.disabled=false; btn.textContent='Log ind'; return;
+          }
+        }catch(e){}
+      }
+      // Fallback lokal
+      currentUser={email,user_metadata:{full_name:'Test Konto'}};
+      localStorage.setItem('sb_session',JSON.stringify({user:currentUser,access_token:'test'}));
+      loadCredits();
+      openApp(); btn.disabled=false; btn.textContent='Log ind'; return;
+    }
+    // Rigtig test-email men forkert kode → afvis
+    if(email===TEST_EMAIL && pass!==TEST_PASS){
+      throw new Error('wrong');
+    }
+    // Almindelige brugere kræver Supabase database
+    if(USE_SUPABASE){
+      const d=await sbFetch('/auth/v1/token?grant_type=password',{email,password:pass});
+      if(d.error||d.error_description||!d.access_token) throw new Error('wrong');
+      isAdmin=false; isTestUser=false;
+      sbToken=d.access_token;
+      currentUser={...d.user,access_token:d.access_token};
+      localStorage.setItem('sb_session',JSON.stringify({user:d.user,access_token:d.access_token}));
+      // Tjek subscription udløb
+      try{
+        const profile=await sbGET('/rest/v1/profiles?select=subscription_expires&email=eq.'+encodeURIComponent(email), d.access_token);
+        if(profile&&profile[0]&&profile[0].subscription_expires){
+          var exp=new Date(profile[0].subscription_expires);
+          if(exp<new Date()){
+            // Subscription udløbet — vis besked og WhatsApp knap
+            err.innerHTML=`
+              <div style="text-align:center;line-height:1.7;">
+                <div style="font-weight:700;color:var(--err);margin-bottom:6px;">Udløbet subscription</div>
+                <div style="color:var(--tx2);font-size:11px;margin-bottom:10px;">Kontakt support på WhatsApp for at forny dit login</div>
+                <a href="https://wa.me/447451296037" target="_blank" style="display:inline-flex;align-items:center;gap:8px;background:#25D366;color:#fff;text-decoration:none;padding:8px 16px;border-radius:8px;font-size:12px;font-weight:700;">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="#fff"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+                  Kontakt support
+                </a>
+              </div>`;
+            err.style.display='block';
+            btn.disabled=false; btn.textContent='Log ind';
+            return;
+          }
+        }
+      }catch(subErr){}
+
+      loadCredits();
+      openApp();
+      // Hent credits fra databasen (asynkront — opdaterer automatisk)
+      fetchCreditsFromDB();
+    } else {
+      // Ingen database opsat → kun admin/test kan logge ind
+      throw new Error('nodb');
+    }
+  } catch(e) {
+    err.textContent = e.message==='nodb'
+      ? 'Database ikke opsat — kun admin kan logge ind'
+      : 'Forkert email eller adgangskode';
+    err.style.display='block';
+  }
+  btn.disabled=false; btn.textContent='Log ind';
+}
+
+
+
+async function doLogout(){
+  localStorage.removeItem('sb_session');
+  currentUser=null; isAdmin=false; isTestUser=false; userCredits=0;
+  showScreen('screen-landing');
+}
+
+function openApp(){
+  showScreen('screen-app');
+  const adminBtn=document.getElementById('bn-admin');
+  if(adminBtn) adminBtn.style.display=isAdmin?'flex':'none';
+  // Admin menu sektion
+  const adminMenuSection=document.getElementById('adminMenuSection');
+  if(adminMenuSection) adminMenuSection.style.display=isAdmin?'block':'none';
+  // Bruger-styring i indstillinger — kun for admin
+  const adminUserCard=document.getElementById('adminUserCard');
+  if(adminUserCard) adminUserCard.style.display=isAdmin?'block':'none';
+  loadUserData();
+  loadSipConfig();
+  renderCtList();
+  updateUI();
+  checkSetup();
+  refreshBalance();
+  startAutoRefresh();
+  updateAccountInfo();
+  switchTab('home');
+}
+
+function updateAccountInfo(){
+  if(!currentUser) return;
+  const name=currentUser.user_metadata?.full_name||currentUser.email||'Bruger';
+  const email=currentUser.email||'';
+  const initials=name.slice(0,1).toUpperCase();
+  document.getElementById('settingsAvatar').textContent=initials;
+  document.getElementById('settingsName').textContent=name;
+  document.getElementById('settingsEmail').textContent=email;
+}
+
+// ── SCREENS / TABS ──────────────────────────────────────────────
+function showScreen(id){
+  // Skjul alle top-niveau screens
+  document.querySelectorAll('body>.screen').forEach(s=>s.classList.remove('active'));
+  document.getElementById(id)?.classList.add('active');
+}
+
+function switchTab(id){
+  if(id==='admin' && !isAdmin) return; // kun admin
+  if(id==='voip' && !isAdmin) return;
+  if(id==='voip'){
+    window._onJsSIPReady(function(){ 
+      if(!ua||!ua.isRegistered()) connectSip();
+    });
+  }
+  document.querySelectorAll('#screen-app .screen').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.bn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+id)?.classList.add('active');
+  document.getElementById('bn-'+id)?.classList.add('active');
+  if(id==='contacts') renderCtList();
+  if(id==='send') updateUI();
+  if(id==='home') updateHomeStats();
+  if(id==='settings') showSubStatus();
+  if(id==='admin'){ document.getElementById('adminCredits').textContent=isAdmin?'∞':userCredits.toLocaleString('da-DK'); document.getElementById('adminContacts').textContent=contacts.length.toLocaleString('da-DK'); const tc=localStorage.getItem('test_credits'); const cur=(tc!==null?parseInt(tc,10):TEST_CREDITS_CURRENT); const el=document.getElementById('adminTestCredits'); if(el) el.textContent=cur.toLocaleString('da-DK')+' credits'; const inp=document.getElementById('adminCreditInput'); if(inp) inp.value=cur; }
+}
+
+function showSubStatus(){
+  var box=document.getElementById('subStatusBox');
+  if(!box) return;
+  // Kun admin er undtaget
+  if(isAdmin){ box.style.display='none'; return; }
+
+  // Hent subscription_expires fra Supabase
+  if(!USE_SUPABASE||!sbToken){
+    // Testkonto eller ingen DB — vis ikke subscription
+    box.style.display='none';
+    return;
+  }
+
+  sbGET('/rest/v1/profiles?select=subscription_expires&id=eq.'+currentUser.id, sbToken)
+  .then(function(data){
+    if(!data||!data[0]||!data[0].subscription_expires){ box.style.display='none'; return; }
+    var exp=new Date(data[0].subscription_expires);
+    var diff=Math.ceil((exp-new Date())/(1000*60*60*24));
+    var txt=document.getElementById('subStatusTxt');
+    var chip=document.getElementById('subDaysChip');
+    var sub=document.getElementById('subStatusSub');
+    box.style.display='block';
+    if(diff>30){
+      box.style.background='rgba(159,232,112,.07)';
+      box.style.borderColor='rgba(159,232,112,.2)';
+      txt.style.color='var(--ok)';
+      txt.textContent='Subscription aktiv';
+      chip.style.color='var(--ok)';
+      chip.textContent=diff+' dage tilbage';
+      sub.textContent='Udløber '+exp.toLocaleDateString('da-DK');
+    } else if(diff>0){
+      box.style.background='rgba(251,191,36,.07)';
+      box.style.borderColor='rgba(251,191,36,.2)';
+      txt.style.color='var(--warn)';
+      txt.textContent='Udløber snart';
+      chip.style.color='var(--warn)';
+      chip.textContent=diff+' dage tilbage';
+      sub.textContent='Forny inden '+exp.toLocaleDateString('da-DK');
+    } else {
+      box.style.background='rgba(248,113,113,.07)';
+      box.style.borderColor='rgba(248,113,113,.2)';
+      txt.style.color='var(--err)';
+      txt.textContent='Subscription udløbet';
+      chip.style.color='var(--err)';
+      chip.textContent='Udløbet';
+      sub.textContent='Kontakt support for at forny';
+    }
+  }).catch(function(){ box.style.display='none'; });
+}
+
+function adminSetTestCredits(){
+  const inp=document.getElementById('adminCreditInput');
+  const val=parseInt(inp.value,10);
+  if(isNaN(val)||val<0){ showToast('Indtast et gyldigt tal'); return; }
+  localStorage.setItem('test_credits', String(val));
+  if(isTestUser){ userCredits=val; refreshBalance(); updateHomeStats(); updateUI(); }
+  const el=document.getElementById('adminTestCredits');
+  if(el) el.textContent=val.toLocaleString('da-DK')+' credits';
+  showToast('Test-kontoens credits sat til '+val.toLocaleString('da-DK'));
+}
+
+function resetTestCredits(){
+  localStorage.setItem('test_credits', String(TEST_CREDITS_DEFAULT));
+  if(isTestUser){ userCredits=TEST_CREDITS_DEFAULT; refreshBalance(); updateHomeStats(); updateUI(); }
+  const el=document.getElementById('adminTestCredits');
+  if(el) el.textContent=TEST_CREDITS_DEFAULT.toLocaleString('da-DK')+' credits';
+  const inp=document.getElementById('adminCreditInput'); if(inp) inp.value=TEST_CREDITS_DEFAULT;
+  showToast('Test-credits nulstillet til '+TEST_CREDITS_DEFAULT.toLocaleString('da-DK'));
+}
+
+async function adminLoadUsers(){
+  const list=document.getElementById('adminUserList');
+  const empty=document.getElementById('adminUserEmpty');
+  if(!USE_SUPABASE){
+    if(empty) empty.textContent='Kræver Supabase — indsæt URL og Key øverst i filen.';
+    return;
+  }
+  if(list) list.innerHTML='<div style="font-size:11px;color:var(--tx3);text-align:center;padding:12px 0;">Henter brugere…</div>';
+  const users=await adminFetchAllUsers();
+  if(!users||users.length===0){
+    if(list) list.innerHTML='<div style="font-size:11px;color:var(--tx3);text-align:center;padding:12px 0;">Ingen brugere fundet i databasen.</div>';
+    return;
+  }
+  if(!list) return;
+  list.innerHTML='';
+  users.forEach(u=>{
+    const row=document.createElement('div');
+    row.style.cssText='background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;';
+    // Beregn dage tilbage
+    var daysLeft='—';
+    var daysColor='var(--tx3)';
+    if(u.subscription_expires){
+      var exp=new Date(u.subscription_expires);
+      var now=new Date();
+      var diff=Math.ceil((exp-now)/(1000*60*60*24));
+      if(diff>30){ daysLeft=diff+' dage'; daysColor='var(--ok)'; }
+      else if(diff>0){ daysLeft=diff+' dage'; daysColor='var(--warn)'; }
+      else { daysLeft='Udløbet'; daysColor='var(--err)'; }
+    }
+    row.innerHTML=`
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--tx);">${u.full_name||'—'}</div>
+          <div style="font-size:10px;color:var(--tx3);">${u.email||u.id}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:16px;font-weight:800;font-family:'Syne',sans-serif;color:var(--blue);" id="ucred_${u.id}">${(u.credits||0).toLocaleString('da-DK')}</div>
+          <div style="font-size:9px;color:var(--tx3);">credits</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+        <div style="font-size:10px;color:var(--tx3);">Subscription</div>
+        <div style="font-size:11px;font-weight:700;color:${daysColor};" id="udays_${u.id}">${daysLeft}</div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <input type="number" inputmode="numeric" placeholder="Nyt antal" value="${u.credits||0}" id="uinp_${u.id}" style="font-size:14px;padding:8px 10px;">
+        <button class="btn btn-blue btn-sm" style="flex-shrink:0;" onclick="adminSaveUserCredits('${u.id}')">Gem</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="date" id="uexp_${u.id}" value="${u.subscription_expires ? u.subscription_expires.split('T')[0] : ''}" style="flex:1;font-size:13px;padding:7px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--tx);-webkit-appearance:none;">
+        <button class="btn btn-blue btn-sm" style="flex-shrink:0;" onclick="adminSaveUserExpiry('${u.id}')">Gem dato</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="password" id="upwd_${u.id}" placeholder="Ny adgangskode" style="flex:1;font-size:13px;padding:7px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--tx);">
+        <button class="btn btn-blue btn-sm" style="flex-shrink:0;" onclick="adminChangePassword('${u.id}')">Skift kode</button>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:2px;">
+        <button class="btn btn-sm" style="background:rgba(239,68,68,.08);color:var(--err);border:1px solid rgba(239,68,68,.2);font-size:11px;" onclick="adminDeleteUser('${u.id}','${u.email}')">🗑 Slet konto</button>
+      </div>`;
+    list.appendChild(row);
+  });
+  showToast(users.length+' brugere hentet');
+}
+
+async function adminCreateUser(){
+  const email=document.getElementById('newUserEmail').value.trim();
+  const pass=document.getElementById('newUserPass').value;
+  const name=document.getElementById('newUserName').value.trim();
+  const credits=parseInt(document.getElementById('newUserCredits').value||'0',10);
+  const status=document.getElementById('createUserStatus');
+
+  status.style.display='block';
+  status.style.color='var(--tx2)';
+  status.textContent='Opretter bruger…';
+
+  if(!email||!pass){status.style.color='var(--err)';status.textContent='Udfyld email og adgangskode';return;}
+  if(pass.length<6){status.style.color='var(--err)';status.textContent='Adgangskode skal være mindst 6 tegn';return;}
+
+  try{
+    // Opret bruger i Supabase Auth
+    const res=await sbFetch('/auth/v1/admin/users',{
+      email,
+      password:pass,
+      email_confirm:true,
+      user_metadata:{full_name:name||email.split('@')[0]}
+    }, SUPABASE_KEY);
+
+    if(res.error||res.msg){
+      status.style.color='var(--err)';
+      status.textContent='Fejl: '+(res.msg||res.error);
+      return;
+    }
+
+    const userId=res.id;
+
+    // Beregn udløbsdato — 6 måneder fra nu
+    var expDate=new Date();
+    expDate.setMonth(expDate.getMonth()+6);
+    var expiresISO=expDate.toISOString();
+
+    // Opret profil med credits + udløbsdato
+    await sbPATCH('/rest/v1/profiles?id=eq.'+userId,{
+      credits,
+      full_name:name||email.split('@')[0],
+      email,
+      subscription_expires: expiresISO
+    }, SUPABASE_KEY);
+
+    status.style.color='var(--ok)';
+    status.textContent='✓ Bruger oprettet! Udløber om 6 måneder.';
+    status.textContent+=' '+credits+' credits tildelt.';
+
+    // Ryd felter
+    document.getElementById('newUserEmail').value='';
+    document.getElementById('newUserPass').value='';
+    document.getElementById('newUserName').value='';
+    document.getElementById('newUserCredits').value='0';
+
+    // Genindlæs brugerliste
+    setTimeout(()=>adminLoadUsers(), 800);
+
+  }catch(e){
+    status.style.color='var(--err)';
+    status.textContent='Fejl: '+e.message;
+  }
+}
+
+async function adminSaveUserExpiry(userId){
+  var inp=document.getElementById('uexp_'+userId);
+  if(!inp||!inp.value){ showToast('Vælg en dato'); return; }
+  var iso=new Date(inp.value+'T00:00:00').toISOString();
+  var ok=await sbPATCH('/rest/v1/profiles?id=eq.'+userId,{
+    subscription_expires: iso
+  }, SUPABASE_KEY);
+  if(ok&&!ok.error){
+    // Opdater dage-visning
+    var exp=new Date(inp.value);
+    var diff=Math.ceil((exp-new Date())/(1000*60*60*24));
+    var daysEl=document.getElementById('udays_'+userId);
+    if(daysEl){
+      if(diff>30){ daysEl.textContent=diff+' dage'; daysEl.style.color='var(--ok)'; }
+      else if(diff>0){ daysEl.textContent=diff+' dage'; daysEl.style.color='var(--warn)'; }
+      else { daysEl.textContent='Udløbet'; daysEl.style.color='var(--err)'; }
+    }
+    showToast('Udløbsdato gemt ✓');
+  } else {
+    showToast('Fejl — kunne ikke gemme dato');
+  }
+}
+
+async function adminChangePassword(userId){
+  var inp=document.getElementById('upwd_'+userId);
+  if(!inp||!inp.value.trim()){ showToast('Indtast ny adgangskode'); return; }
+  var newPass=inp.value.trim();
+  if(newPass.length<6){ showToast('Adgangskode skal være mindst 6 tegn'); return; }
+
+  // Brug Supabase Admin API til at ændre password
+  var token=getAdminToken();
+  var res=await fetch(SUPABASE_URL+'/auth/v1/admin/users/'+userId,{
+    method:'PUT',
+    headers:{
+      'Content-Type':'application/json',
+      'apikey':SUPABASE_SERVICE_KEY_VAL,
+      'Authorization':'Bearer '+SUPABASE_SERVICE_KEY_VAL
+    },
+    body:JSON.stringify({password:newPass})
+  });
+  if(res.ok){
+    inp.value='';
+    showToast('✓ Adgangskode ændret');
+  } else {
+    var d=await res.json();
+    showToast('Fejl: '+(d.message||d.error||'Ukendt fejl'));
+  }
+}
+
+async function adminDeleteUser(userId, email){
+  if(!confirm('Slet konto: '+email+'. Dette kan ikke fortrydes!')) return;
+
+  // Slet fra auth
+  var res=await fetch(SUPABASE_URL+'/auth/v1/admin/users/'+userId,{
+    method:'DELETE',
+    headers:{
+      'apikey':SUPABASE_SERVICE_KEY_VAL,
+      'Authorization':'Bearer '+SUPABASE_SERVICE_KEY_VAL
+    }
+  });
+
+  if(res.ok||res.status===204){
+    // Slet også fra profiles tabel
+    await fetch(SUPABASE_URL+'/rest/v1/profiles?id=eq.'+userId,{
+      method:'DELETE',
+      headers:{
+        'apikey':SUPABASE_SERVICE_KEY_VAL,
+        'Authorization':'Bearer '+SUPABASE_SERVICE_KEY_VAL,
+        'Content-Type':'application/json'
+      }
+    });
+    showToast('✓ Konto slettet: '+email);
+    setTimeout(function(){ adminLoadUsers(); },800);
+  } else {
+    var d=await res.json().catch(function(){return{};});
+    showToast('Fejl: '+(d.message||d.error||'Kunne ikke slette'));
+  }
+}
+
+async function adminSaveUserCredits(userId){
+  const inp=document.getElementById('uinp_'+userId);
+  if(!inp) return;
+  const val=parseInt(inp.value,10);
+  if(isNaN(val)||val<0){ showToast('Ugyldigt tal'); return; }
+  const ok=await adminSetUserCredits(userId,val);
+  if(ok){
+    const el=document.getElementById('ucred_'+userId);
+    if(el) el.textContent=val.toLocaleString('da-DK');
+    showToast('Credits opdateret til '+val.toLocaleString('da-DK'));
+  } else {
+    showToast('Fejl — check Supabase-opsætning');
+  }
+}
+
+function updateHomeStats(){
+  if(document.getElementById('homeCredits')) document.getElementById('homeCredits').textContent = isAdmin ? '∞' : userCredits.toLocaleString('da-DK');
+  if(document.getElementById('homeContacts')) document.getElementById('homeContacts').textContent=contacts.length.toLocaleString('da-DK');
+}
+
+function scrollToPricing(){
+  document.getElementById('pricing-section')?.scrollIntoView({behavior:'smooth'});
+}
+
+// ── STATE ───────────────────────────────────────────────────────
+const SMS_API='/.netlify/functions/send-sms';
+let contacts=JSON.parse(localStorage.getItem('ms_ct')||'[]');
+let logs=[],isSending=false,cancelFlag=false;
+
+function loadUserData(){
+  contacts=JSON.parse(localStorage.getItem('ms_ct')||'[]');
+}
+
+function saveCtx(){localStorage.setItem('ms_ct',JSON.stringify(contacts));}
+
+// ── UI ──────────────────────────────────────────────────────────
+// Beregn antal credits pr. SMS baseret på beskedlængde
+function calcCreditsPerSms(msgLength){
+  if(msgLength===0) return 0;
+  if(msgLength<=160) return 1;
+  if(msgLength<=306) return 2;  // 153 tegn pr. del efter første
+  if(msgLength<=459) return 3;
+  if(msgLength<=612) return 4;
+  if(msgLength<=765) return 5;
+  return Math.ceil((msgLength-160)/153)+1;
+}
+
+function updateUI(){
+  const msg=document.getElementById('message')?.value||'';
+  const sender=document.getElementById('senderName')?.value||'';
+  const l=msg.length;
+  if(l>3000){ document.getElementById('message').value=msg.slice(0,3000); }
+
+  const credPerContact=calcCreditsPerSms(l);
+  const total=contacts.length;
+  const cost=total*credPerContact;
+
+  document.getElementById('charCount').textContent=l+' tegn';
+  document.getElementById('smsCount').textContent=credPerContact+' credit'+(credPerContact!==1?'s':'')+' pr. kontakt';
+  document.getElementById('senderCount').textContent=sender.length+'/11';
+  document.getElementById('recipCount').textContent=total.toLocaleString('da-DK');
+
+  if(total>0){
+    document.getElementById('recipPreview').textContent=contacts.slice(0,3).map(c=>c.name||c.number).join(', ')+(total>3?` +${total-3} mere`:'');
+    document.getElementById('recipPreview').style.display='block';
+  } else { document.getElementById('recipPreview').style.display='none'; }
+
+  const hasCredits = isAdmin || userCredits===Infinity || cost<=userCredits;
+  const canSend=msg.trim()&&sender.trim()&&total>0&&!isSending&&hasCredits;
+  const btn=document.getElementById('sendBtn');
+  btn.disabled=!canSend;
+  if(total>0 && !hasCredits && !isAdmin){
+    btn.textContent='Mangler credits — behøver '+cost.toLocaleString('da-DK');
+  } else if(total>0){
+    btn.textContent='Send til '+total.toLocaleString('da-DK')+' kontakter · '+cost.toLocaleString('da-DK')+' credits i alt';
+  } else {
+    btn.textContent='Send til 0 kontakter';
+  }
+}
+
+function checkSetup(){
+  document.getElementById('warnBanner').style.display='none';
+}
+
+// ── SETTINGS ───────────────────────────────────────────────────
+function saveSettings(){
+  showToast('Indstillinger gemt!');
+}
+
+function togglePass(id,btn){
+  const i=document.getElementById(id);
+  i.type=i.type==='password'?'text':'password';
+  btn.textContent=i.type==='password'?'Vis':'Skjul';
+}
+
+// ── BALANCE ─────────────────────────────────────────────────────
+function refreshBalance(){
+  const el=document.getElementById('balText');
+  const badge=document.getElementById('balBadge');
+  if(!el) return;
+  if(isAdmin){
+    el.textContent='∞ Credits';
+    if(badge){ badge.style.color='var(--cyan)'; badge.style.borderColor=''; }
+  } else if(isTestUser){
+    el.textContent=userCredits.toLocaleString('da-DK')+' Credits';
+    if(badge){
+      if(userCredits<=0) badge.style.color='var(--err)';
+      else if(userCredits<150) badge.style.color='var(--warn)';
+      else badge.style.color='var(--cyan)';
+    }
+  } else {
+    el.textContent=userCredits.toLocaleString('da-DK')+' Credits';
+    if(badge){
+      if(userCredits<=0) badge.style.color='var(--err)';
+      else if(userCredits<50) badge.style.color='var(--warn)';
+      else badge.style.color='var(--cyan)';
+    }
+  }
+}
+function startAutoRefresh(){}
+
+// ── SMS SEND ────────────────────────────────────────────────────
+async function sms(to,body,from){
+  var num=to.trim().replace(/^\+/,'').replace(/[^0-9]/g,'');
+  const res=await fetch(SMS_API,{method:'POST',mode:'cors',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:num,message:body,sender_id:from})});
+  let d; try{ d=await res.json(); }catch(e){ d={}; }
+  const ok = res.ok && (d.success || d.message_id);
+  if(ok) return{ok:true};
+  return{ok:false,error:d.error||'Fejl'};
+}
+
+async function doSend(){
+  const msg=document.getElementById('message').value.trim();
+  const sender=document.getElementById('senderName').value.trim();
+  if(!msg||!sender||!contacts.length||isSending)return;
+  // Credit-tjek (admin sender uden træk)
+  const credPerContact=calcCreditsPerSms(msg.length);
+  const cost=contacts.length*credPerContact;
+  if(!isAdmin && userCredits!==Infinity && cost>userCredits){
+    showErrorPopup('Du mangler credits. Afsendelse kræver '+cost.toLocaleString('da-DK')+' credits, men du har kun '+userCredits.toLocaleString('da-DK')+'.');
+    return;
+  }
+  isSending=true;cancelFlag=false;
+  document.getElementById('progressCard').style.display='block';
+  document.getElementById('sendBtn').disabled=true;
+  document.getElementById('sendingPopup').classList.add('open');
+  document.getElementById('sendingBar').style.width='0%';
+  document.getElementById('sendingTitle').textContent='Sender beskeder…';
+  document.getElementById('sendingSub').textContent='Vent venligst…';
+  let sent=0,failed=0;
+  const total=contacts.length;
+  const startCredits=userCredits;
+  for(let i=0;i<contacts.length;i+=50){
+    if(cancelFlag){addLog('warn','Annulleret');break;}
+    await Promise.all(contacts.slice(i,i+50).map(async c=>{
+      try{
+        const r=await sms(c.number,msg,sender);
+        if(r.ok){ sent++; addLog('ok',`✓ ${c.name||c.number}`); }
+        else{ failed++; addLog('err',`✗ ${c.number}: ${r.error}`); }
+      }catch(e){failed++;addLog('err',`✗ ${c.number}: ${e.message}`);}
+      // Træk credits løbende baseret på antal sendte (ikke for admin)
+      if(!isAdmin){
+        userCredits=Math.max(0, startCredits - sent*credPerContact);
+        saveCredits();
+        refreshBalance();
+        updateHomeStats();
+  // SMS gateway klar
+  (function(){
+    var dot=document.getElementById('smsGwDot');
+    var txt=document.getElementById('smsGwTxt');
+    var sub=document.getElementById('smsGwSub');
+    if(dot){dot.style.background='var(--ok)';}
+    if(txt){txt.style.color='var(--ok)';txt.textContent='Gateway klar';}
+    if(sub){sub.textContent='Klar til SMS';}
+  })();
+      }
+      const pct=Math.round(((sent+failed)/total)*100);
+      setP(sent,failed,total,pct);
+      document.getElementById('sendingBar').style.width=pct+'%';
+      document.getElementById('sendingPct').textContent=pct+'%';
+    }));
+    if(i+50<contacts.length)await sl(1200);
+  }
+  // Endelig præcis afregning
+  if(!isAdmin){
+    userCredits=Math.max(0, startCredits - sent*credPerContact);
+    saveCredits();
+    // Gem i Supabase — både for Supabase-brugere og test-konto
+    if(USE_SUPABASE && currentUser?.id){
+      // Brug sbToken hvis tilgængelig, ellers service key
+      const token = sbToken || SUPABASE_SERVICE_KEY_VAL;
+      try{
+        await sbPATCH('/rest/v1/profiles?id=eq.'+currentUser.id,{credits:userCredits},token);
+      }catch(e){}
+    }
+  }
+  isSending=false;
+  document.getElementById('sendBtn').disabled=false;
+  refreshBalance();
+  updateHomeStats();
+  // SMS gateway klar
+  (function(){
+    var dot=document.getElementById('smsGwDot');
+    var txt=document.getElementById('smsGwTxt');
+    var sub=document.getElementById('smsGwSub');
+    if(dot){dot.style.background='var(--ok)';}
+    if(txt){txt.style.color='var(--ok)';txt.textContent='Gateway klar';}
+    if(sub){sub.textContent='Klar til SMS';}
+  })();
+  updateUI();
+  // Loader → opdater saldo
+  document.getElementById('sendingTitle').textContent='Sender din besked…';
+  document.getElementById('sendingSub').textContent='Henter opdateret saldo…';
+  let wpct=0;
+  const wi=setInterval(()=>{ wpct+=2; document.getElementById('sendingBar').style.width=wpct+'%'; if(wpct>=100)clearInterval(wi); },100);
+  await sl(5000);
+  clearInterval(wi);
+  refreshBalance();
+  document.getElementById('sendingPopup').classList.remove('open');
+  document.getElementById('sendingTitle').textContent='Sender beskeder…';
+  document.getElementById('sendingSub').textContent='Vent venligst…';
+  if(sent>0) showSuccessPopup(sent,failed);
+  else showErrorPopup(`${failed} besked${failed>1?'er':''} fejlede`);
+}
+
+const sl=ms=>new Promise(r=>setTimeout(r,ms));
+function setP(s,f,t,pct){
+  document.getElementById('pSent').textContent=`✓ ${s}`;
+  document.getElementById('pFailed').textContent=`✗ ${f}`;
+  document.getElementById('pPct').textContent=pct+'%';
+  document.getElementById('progFill').style.width=pct+'%';
+  document.getElementById('pSub').textContent=`${s+f} / ${t}`;
+}
+
+function showSuccessPopup(sent,failed){
+  document.getElementById('popSent').textContent=sent.toLocaleString('da-DK');
+  document.getElementById('popFailed').textContent=failed.toLocaleString('da-DK');
+  document.getElementById('popCredits').textContent=isAdmin?'∞':userCredits.toLocaleString('da-DK');
+  document.getElementById('successSub').textContent=failed>0?`${sent} sendt, ${failed} fejlede`:'Alle beskeder sendt!';
+  document.getElementById('successPopup').classList.add('open');
+  startConfetti();
+}
+function closeSuccess(){ document.getElementById('successPopup').classList.remove('open'); stopConfetti(); }
+function showErrorPopup(msg){ document.getElementById('errMsg').textContent=msg; document.getElementById('errorPopup').classList.add('open'); }
+function closeError(){ document.getElementById('errorPopup').classList.remove('open'); }
+
+// ── CONFETTI ────────────────────────────────────────────────────
+let confAnim=null;
+function startConfetti(){
+  const c=document.getElementById('confetti');
+  const ctx=c.getContext('2d');
+  c.width=c.offsetWidth; c.height=c.offsetHeight;
+  const cols=['#2563eb','#06b6d4','#10b981','#f59e0b','#a855f7'];
+  const p=Array.from({length:60},()=>({x:Math.random()*c.width,y:Math.random()*c.height-c.height,r:Math.random()*4+2,d:Math.random()*60+20,col:cols[Math.floor(Math.random()*cols.length)],ti:0,ts:Math.random()*.1+.05,sp:Math.random()*2+1}));
+  function draw(){
+    ctx.clearRect(0,0,c.width,c.height);
+    p.forEach(q=>{ctx.beginPath();ctx.lineWidth=q.r;ctx.strokeStyle=q.col;ctx.moveTo(q.x+Math.sin(q.ti)*10+q.r/3,q.y);ctx.lineTo(q.x+Math.sin(q.ti)*10,q.y+q.r);ctx.stroke();q.ti+=q.ts;q.y+=q.sp;if(q.y>c.height){q.y=-10;q.x=Math.random()*c.width;}});
+    confAnim=requestAnimationFrame(draw);
+  }
+  draw(); setTimeout(stopConfetti,4000);
+}
+function stopConfetti(){if(confAnim){cancelAnimationFrame(confAnim);confAnim=null;} const c=document.getElementById('confetti');if(c)c.getContext('2d').clearRect(0,0,c.width,c.height);}
+
+// ── CONTACTS ───────────────────────────────────────────────────
+function renderCtList(){
+  const q=(document.getElementById('ctSearch')?.value||'').toLowerCase();
+  const flt=contacts.filter(c=>!q||(c.name||'').toLowerCase().includes(q)||c.number.includes(q));
+  const list=document.getElementById('ctList');
+  const card=document.getElementById('ctCard');
+  const empty=document.getElementById('ctEmpty');
+  if(document.getElementById('ctTitle')) document.getElementById('ctTitle').textContent=`Kontakter (${contacts.length.toLocaleString('da-DK')})`;
+  if(!contacts.length){card.style.display='none';empty.style.display='flex';return;}
+  card.style.display='block';empty.style.display='none';
+  list.innerHTML='';
+  flt.slice(0,400).forEach(c=>{
+    const idx=contacts.indexOf(c);
+    const row=document.createElement('div');
+    row.className='ct-item';
+    row.innerHTML=`<div class="ct-av">${(c.name||c.number).slice(0,1).toUpperCase()}</div><div style="flex:1;min-width:0;"><div class="ct-name">${c.name||'—'}</div><div class="ct-num">${c.number}</div></div><button onclick="delCt(${idx})" style="background:none;border:none;cursor:pointer;color:var(--tx3);font-size:18px;padding:4px;">×</button>`;
+    list.appendChild(row);
+  });
+  if(flt.length>400){const n=document.createElement('div');n.style.cssText='text-align:center;font-size:10px;color:var(--tx3);padding:8px;';n.textContent=`+${flt.length-400} flere`;list.appendChild(n);}
+  updateUI();
+}
+function delCt(i){contacts.splice(i,1);saveCtx();renderCtList();updateUI();}
+function clearAll(){if(!confirm(`Slet alle ${contacts.length} kontakter?`))return;contacts=[];saveCtx();renderCtList();updateUI();}
+
+function importVCF(inp){
+  const f=inp.files[0];if(!f)return;
+  const r=new FileReader();
+  r.onload=e=>{
+    const ex=new Set(contacts.map(c=>c.number));let added=0;
+    e.target.result.split(/BEGIN:VCARD/i).slice(1).forEach(card=>{
+      const nm=(card.match(/FN:(.+)/i)||card.match(/N:([^;\r\n]+)/i)||[])[1]||'';
+      const name=nm.trim().replace(/\r/g,'');
+      [...card.matchAll(/TEL[^:]*:([^\r\n]+)/gi)].forEach(m=>{
+        let n=m[1].trim().replace(/[\s\-\(\)]/g,'').replace(/\r/g,'');
+        if(!n)return;
+        if(n.startsWith('00'))n='+'+n.slice(2);
+        if(/^\d{8}$/.test(n))n='+45'+n;
+        if(!/^\+/.test(n)&&n.length>=9)n='+'+n;
+        if(n.length>7&&!ex.has(n)){contacts.push({name,number:n});ex.add(n);added++;}
+      });
+    });
+    contacts=contacts.slice(0,10000);saveCtx();renderCtList();updateUI();showToast(`${added.toLocaleString('da-DK')} importeret`);inp.value='';
+  };r.readAsText(f,'UTF-8');
+}
+
+function importCSV(inp){
+  const f=inp.files[0];if(!f)return;
+  const r=new FileReader();
+  r.onload=e=>{
+    const ex=new Set(contacts.map(c=>c.number));let added=0;
+    e.target.result.split(/[\r\n]+/).filter(Boolean).forEach(line=>{
+      line.split(/[,;\t]/).forEach(cell=>{
+        let n=cell.trim().replace(/[\s\-\(\)"']/g,'');
+        if(!n||n.length<7)return;
+        if(n.startsWith('00'))n='+'+n.slice(2);
+        if(/^\d{8}$/.test(n))n='+45'+n;
+        if(!/^\+/.test(n)&&n.length>=9)n='+'+n;
+        if(/^\+\d{7,15}$/.test(n)&&!ex.has(n)){contacts.push({name:'',number:n});ex.add(n);added++;}
+      });
+    });
+    contacts=contacts.slice(0,10000);saveCtx();renderCtList();updateUI();showToast(`${added.toLocaleString('da-DK')} importeret`);inp.value='';
+  };r.readAsText(f,'UTF-8');
+}
+
+function openManual(){document.getElementById('manualModal').classList.add('open');}
+function closeManual(){document.getElementById('manualModal').classList.remove('open');}
+function parseNums(txt){return txt.split(/[\n,;]+/).map(n=>{let v=n.trim().replace(/[\s\-\(\)]/g,'');if(!v||v.length<7)return null;if(v.startsWith('00'))v='+'+v.slice(2);if(/^\d{8}$/.test(v))v='+45'+v;if(!/^\+/.test(v)&&v.length>=9)v='+'+v;return/^\+\d{7,15}$/.test(v)?v:null;}).filter(Boolean);}
+function manualCount(){document.getElementById('manualHint').textContent=parseNums(document.getElementById('manualTa').value).length+' numre fundet';}
+function saveManual(){const nums=parseNums(document.getElementById('manualTa').value);const ex=new Set(contacts.map(c=>c.number));let added=0;nums.forEach(n=>{if(!ex.has(n)){contacts.push({name:'',number:n});ex.add(n);added++;}});contacts=contacts.slice(0,10000);saveCtx();renderCtList();updateUI();closeManual();document.getElementById('manualTa').value='';showToast(added+' tilføjet');}
+document.getElementById('manualModal').addEventListener('click',e=>{if(e.target===document.getElementById('manualModal'))closeManual();});
+
+// ── LOG ─────────────────────────────────────────────────────────
+function addLog(type,msg){
+  logs.unshift({type,msg,time:new Date().toLocaleTimeString('da-DK')});
+  const list=document.getElementById('logList');
+  document.getElementById('logEmpty')?.remove();
+  const row=document.createElement('div');row.className='log-row';
+  row.innerHTML=`<span class="log-t">${new Date().toLocaleTimeString('da-DK')}</span><span class="c-${type}" style="word-break:break-all;">${msg}</span>`;
+  list.prepend(row);
+  const bn=document.getElementById('bn-log');
+  if(!bn.querySelector('.bn-dot')){const d=document.createElement('div');d.className='bn-dot';bn.appendChild(d);}
+}
+function clearLog(){logs=[];document.getElementById('logList').innerHTML='<div class="empty" id="logEmpty"><div class="empty-ico">📋</div><div class="empty-t">Ingen aktivitet</div></div>';document.getElementById('bn-log').querySelector('.bn-dot')?.remove();}
+
+// ── TOAST ───────────────────────────────────────────────────────
+let tt;
+function showToast(txt){const t=document.getElementById('toast');t.textContent=txt;t.classList.add('show');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('show'),2800);}
+
+// ── BTC BETALING ────────────────────────────────────────────────
+// API base — peg på din Netlify-server URL
+const API_BASE = 'https://msg-server.netlify.app/api';
+
+let currentPaymentId = null;
+let paymentCheckInterval = null;
+let btcRateInterval = null;
+let currentPackageId = null;
+
+async function fetchAndShowBtcRate(packageId){
+  const pkg = BTC_PACKAGES[packageId];
+  if(!pkg) return;
+  const el=document.getElementById('btcBtcAmount');
+  if(el) el.textContent='Henter live kurs...';
+
+  let dkkRate=null;
+
+  // Kilde 1: Coinbase (tillader CORS, ingen API nøgle)
+  try{
+    const r=await fetch('https://api.coinbase.com/v2/exchange-rates?currency=BTC');
+    const d=await r.json();
+    const usd=parseFloat(d?.data?.rates?.USD);
+    const dkk=parseFloat(d?.data?.rates?.DKK);
+    if(dkk>100000) dkkRate=dkk;
+    else if(usd>10000){
+      // Hent USD→DKK fra Coinbase
+      const r2=await fetch('https://api.coinbase.com/v2/exchange-rates?currency=USD');
+      const d2=await r2.json();
+      const usdToDkk=parseFloat(d2?.data?.rates?.DKK);
+      if(usdToDkk>5) dkkRate=usd*usdToDkk;
+    }
+  }catch(e){}
+
+  // Kilde 2: Blockchain.info USD × ECB DKK rate
+  if(!dkkRate){
+    try{
+      const r=await fetch('https://blockchain.info/ticker');
+      const d=await r.json();
+      const usd=d?.USD?.last;
+      if(usd>10000) dkkRate=usd*6.88; // Fast USD→DKK fallback
+    }catch(e){}
+  }
+
+  if(dkkRate){
+    dkkRate=Math.round(dkkRate);
+    const btcAmount=(pkg.priceDKK/dkkRate).toFixed(8);
+    const now=new Date().toLocaleTimeString('da-DK',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    if(el) el.textContent='Send præcis: '+btcAmount+' BTC\n1 BTC \u2248 '+dkkRate.toLocaleString('da-DK')+' DKK\nSidst opdateret: '+now;
+  } else {
+    if(el) el.textContent='Tjek live kurs via linket nedenfor';
+  }
+}
+
+// Prispakker til BTC-beregning
+const BTC_PACKAGES = {
+  starter:      { credits:100,  priceDKK:400  },
+  business:     { credits:250,  priceDKK:900  },
+  pro:          { credits:500,  priceDKK:1750 },
+  subscription: { credits:0,    priceDKK:900  },
+};
+
+async function openBtcModal(packageId, label, amount){
+  document.getElementById('btcModalSub').textContent=label+' · '+amount;
+  document.getElementById('btcAddress').textContent='32hQrHgbpcPMsGxnkgj9gaHB5Cezbw9Lhe';
+  document.getElementById('btcModal').classList.add('open');
+  document.getElementById('btcConfirmStatus').style.display='none';
+  document.getElementById('btcBtcAmount').textContent='Beregner BTC-beløb…';
+
+  currentPackageId = packageId;
+
+  // Hent kurs med det samme
+  await fetchAndShowBtcRate(packageId);
+
+  // Opdater hvert 10 sekunder
+  if(btcRateInterval) clearInterval(btcRateInterval);
+  btcRateInterval = setInterval(()=>fetchAndShowBtcRate(currentPackageId), 10000);
+
+  // Prøv også server (opretter betaling i DB for auto-bekræftelse)
+  try {
+    const res = await fetch(API_BASE+'/create-payment', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        userId: currentUser?.id || 'local',
+        packageId,
+        userEmail: currentUser?.email || '',
+      })
+    });
+    const d = await res.json();
+    if(d.paymentId && currentUser?.id){
+      currentPaymentId = d.paymentId;
+      startPaymentPolling(d.paymentId);
+    }
+  } catch(e){ /* Server ikke tilgængelig — manuelt flow */ }
+}
+
+function startPaymentPolling(paymentId){
+  if(paymentCheckInterval) clearInterval(paymentCheckInterval);
+  const status=document.getElementById('btcConfirmStatus');
+  status.style.display='block';
+  status.textContent='⏳ Venter på BTC-transaktion…';
+  status.style.color='var(--warn)';
+
+  paymentCheckInterval=setInterval(async()=>{
+    try{
+      const res=await fetch(API_BASE+'/verify-payment',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({paymentId, userId:currentUser.id})
+      });
+      const d=await res.json();
+      if(d.status==='confirming'){
+        status.textContent=`⛓ ${d.confirmations}/${d.required} bekræftelser…`;
+        status.style.color='var(--warn)';
+      } else if(d.status==='confirmed'){
+        clearInterval(paymentCheckInterval);
+        status.textContent='✅ Betaling bekræftet! +'+d.credits+' credits tilføjet';
+        status.style.color='var(--ok)';
+        userCredits=d.newTotal;
+        saveCredits();
+        refreshBalance();
+        updateHomeStats();
+  // SMS gateway klar
+  (function(){
+    var dot=document.getElementById('smsGwDot');
+    var txt=document.getElementById('smsGwTxt');
+    var sub=document.getElementById('smsGwSub');
+    if(dot){dot.style.background='var(--ok)';}
+    if(txt){txt.style.color='var(--ok)';txt.textContent='Gateway klar';}
+    if(sub){sub.textContent='Klar til SMS';}
+  })();
+        updateUI();
+        showToast('🎉 '+d.credits+' credits tilføjet til din konto!');
+        setTimeout(()=>closeBtcModal(), 3000);
+      } else {
+        status.textContent='⏳ '+( d.message||'Venter på transaktion…');
+      }
+    }catch(e){}
+  }, 30000); // Tjek hvert 30 sek
+}
+
+function closeBtcModal(){
+  document.getElementById('btcModal').classList.remove('open');
+  if(paymentCheckInterval) clearInterval(paymentCheckInterval);
+  if(btcRateInterval) clearInterval(btcRateInterval);
+}
+
+function copyBtc(){
+  const addr=document.getElementById('btcAddress').textContent;
+  if(addr==='Henter adresse…') return;
+  navigator.clipboard?.writeText(addr).then(()=>{
+    showToast('BTC-adresse kopieret!');
+    document.getElementById('copyBtcBtn').textContent='✓ Kopieret';
+    setTimeout(()=>{ document.getElementById('copyBtcBtn').textContent='Kopiér adresse'; },2000);
+  }).catch(()=>{ showToast('Kopiér manuelt: '+addr); });
+}
+
+function copyBtcAmount(){
+  const txt=document.getElementById('btcBtcAmount').textContent;
+  // Udtræk kun BTC-beløbet (første linje, efter "Send præcis: ")
+  const match=txt.match(/Send præcis:\s*([\d.]+)\s*BTC/);
+  const amount=match?match[1]:null;
+  if(!amount){ showToast('Beløb ikke hentet endnu — vent et øjeblik'); return; }
+  navigator.clipboard?.writeText(amount).then(()=>{
+    showToast('BTC-beløb kopieret: '+amount);
+    document.getElementById('copyAmountBtn').textContent='✓ Kopieret';
+    setTimeout(()=>{ document.getElementById('copyAmountBtn').textContent='Kopiér beløb'; },2000);
+  }).catch(()=>{ showToast('Kopiér manuelt: '+amount); });
+}
+document.getElementById('btcModal').addEventListener('click',e=>{ if(e.target===document.getElementById('btcModal')) closeBtcModal(); });
+
+// ── MENU ────────────────────────────────────────────────────────
+let menuOpen=false;
+function toggleMenu(){
+  menuOpen=!menuOpen;
+  document.getElementById('appMenu').style.display=menuOpen?'block':'none';
+  document.getElementById('menuOverlay').style.display=menuOpen?'block':'none';
+  // Animér hamburger til X
+  const b1=document.getElementById('menuBar1');
+  const b2=document.getElementById('menuBar2');
+  const b3=document.getElementById('menuBar3');
+  if(menuOpen){
+    b1.style.transform='translateY(6px) rotate(45deg)';
+    b2.style.opacity='0';
+    b3.style.transform='translateY(-6px) rotate(-45deg)';
+  } else {
+    b1.style.transform=''; b2.style.opacity='1'; b3.style.transform='';
+  }
+}
+function closeMenu(){
+  menuOpen=false;
+  document.getElementById('appMenu').style.display='none';
+  document.getElementById('menuOverlay').style.display='none';
+  document.getElementById('menuBar1').style.transform='';
+  document.getElementById('menuBar2').style.opacity='1';
+  document.getElementById('menuBar3').style.transform='';
+}
+function menuNav(tab){
+  closeMenu();
+  switchTab(tab);
+}
+
+// ── VOIP ────────────────────────────────────────────────────────
+let voipActive=false;
+let voipMuted=false;
+let voipOnHold=false;
+let voipSpeaker=false;
+const voipCallerMode='business'; // altid firma
+let voipCallTimer=null;
+let voipCallSeconds=0;
+let holdAudio=null;
+// Telnyx credentials
+const SIPUP_CONFIG={
+  user:      'Frederik007',
+  pass:      'Hellothere123!!',
+  server:    'sip.telnyx.com',
+  wsServer:  'wss://sip.telnyx.com:7443',
+  port:      7443,
+};
+let sipConfig={
+  server:     SIPUP_CONFIG.server,
+  user:       SIPUP_CONFIG.user,
+  pass:       SIPUP_CONFIG.pass,
+  businessNum:'',
+  privateNum: ''
+};
+
+// JsSIP UA (User Agent)
+let ua=null;
+let currentSession=null;
+
+// Indlæs SIP config fra localStorage
+function loadSipConfig(){
+  const s=localStorage.getItem('sip_config');
+  if(s){ try{ sipConfig=JSON.parse(s); }catch(e){} }
+  if(document.getElementById('sipServer')) document.getElementById('sipServer').value=sipConfig.server||'';
+  if(document.getElementById('sipUser')) document.getElementById('sipUser').value=sipConfig.user||'';
+  if(document.getElementById('sipPass')) document.getElementById('sipPass').value=sipConfig.pass||'';
+  if(document.getElementById('sipBusinessNum')) document.getElementById('sipBusinessNum').value=sipConfig.businessNum||'';
+  if(document.getElementById('callerNumber')) document.getElementById('callerNumber').value=sipConfig.businessNum||'';
+  if(document.getElementById('sipPrivateNum')) document.getElementById('sipPrivateNum').value=sipConfig.privateNum||'';
+  updateCallerLabel();
+}
+
+function saveSipConfig(){
+  sipConfig={
+    server:document.getElementById('sipServer')?.value||'',
+    user:document.getElementById('sipUser')?.value||'',
+    pass:document.getElementById('sipPass')?.value||'',
+    businessNum:document.getElementById('sipBusinessNum')?.value||'',
+    privateNum:document.getElementById('sipPrivateNum')?.value||'',
+  };
+  localStorage.setItem('sip_config',JSON.stringify(sipConfig));
+  updateCallerLabel();
+}
+
+function selectCaller(mode){ /* ikke i brug */ }
+
+function saveBusinessNum(val){
+  sipConfig.businessNum=val;
+  localStorage.setItem('sip_config',JSON.stringify(sipConfig));
+  const el=document.getElementById('numSaved');
+  if(el){ el.textContent='✓ Gemt'; setTimeout(()=>el.textContent='',1500); }
+}
+
+function updateCallerLabel(){
+  const el=document.getElementById('callerNumber');
+  if(el && el.tagName==='INPUT') el.value=sipConfig.businessNum||'';
+}
+
+// Dialpad
+function dialPress(key){
+  const d=document.getElementById('dialDisplay');
+  if(!d) return;
+  if(d.textContent.length<16) d.textContent+=key;
+  // Tryk-lyd via Web Audio
+  try{
+    const ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator();
+    const g=ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value=800; g.gain.value=0.1;
+    o.start(); o.stop(ctx.currentTime+0.08);
+  }catch(e){}
+}
+
+function dialPaste(){
+  if(navigator.clipboard&&navigator.clipboard.readText){
+    navigator.clipboard.readText().then(function(txt){
+      if(!txt) return;
+      var clean=txt.replace(/[^0-9+]/g,'');
+      if(clean&&!clean.startsWith('+')) clean='+'+clean;
+      if(clean.length>1){ document.getElementById('dialDisplay').textContent=clean; showToast('Nummer indsat'); }
+    }).catch(function(){ showToast('Tillad udklipsholder i Safari indstillinger'); });
+  }
+}
+function dialDelete(){
+  const d=document.getElementById('dialDisplay');
+  if(!d||d.textContent.length<=0) return;
+  d.textContent=d.textContent.slice(0,-1);
+}
+
+// Variabler til ringetone og auto-hangup
+var ringAudioCtx=null;
+var ringInterval=null;
+var autoHangupTimer=null;
+
+function playRingTone(){
+  try{
+    ringAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    function beep(){
+      if(!ringAudioCtx) return;
+      var o=ringAudioCtx.createOscillator();
+      var g=ringAudioCtx.createGain();
+      o.connect(g); g.connect(ringAudioCtx.destination);
+      // iPhone ringetone: 480Hz + 440Hz blandet
+      o.type='sine'; o.frequency.value=480;
+      g.gain.setValueAtTime(0,ringAudioCtx.currentTime);
+      g.gain.linearRampToValueAtTime(0.2,ringAudioCtx.currentTime+0.05);
+      g.gain.linearRampToValueAtTime(0,ringAudioCtx.currentTime+0.8);
+      o.start(ringAudioCtx.currentTime);
+      o.stop(ringAudioCtx.currentTime+0.85);
+    }
+    beep();
+    ringInterval=setInterval(beep, 3000);
+  }catch(e){}
+}
+
+function stopRingTone(){
+  clearInterval(ringInterval); ringInterval=null;
+  if(ringAudioCtx){ try{ringAudioCtx.close();}catch(e){} ringAudioCtx=null; }
+}
+
+function makeCall(){
+  const num=document.getElementById('dialDisplay').textContent.trim();
+  if(!num||num==='+45'){ showToast('Indtast et telefonnummer'); return; }
+
+  // Bed om mikrofon tilladelse FØR opkaldet starter
+  navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+    // Stop stream igen — Relay SDK håndterer den selv
+    stream.getTracks().forEach(function(t){ t.stop(); });
+    // Nu start opkald
+    startCallFlow(num);
+  }).catch(function(err){
+    showToast('Tillad mikrofon for at ringe');
+    return;
+  });
+}
+
+function startCallFlow(num){
+  voipActive=true; voipMuted=false; voipOnHold=false;
+  document.getElementById('voipDialpad').style.display='none';
+  document.getElementById('voipCallDisplay').style.display='block';
+  document.getElementById('voipCallNumber').textContent=num;
+  document.getElementById('voipCallState').textContent='Ringer…';
+  document.getElementById('voipStatusDot').style.background='var(--warn)';
+  document.getElementById('voipStatusTxt').textContent='Ringer: '+num;
+
+  // iPhone ringetone
+  playRingTone();
+
+  // Auto-hangup efter 3 minutter hvis ikke besvaret
+  autoHangupTimer=setTimeout(function(){
+    if(voipActive && document.getElementById('voipCallState').textContent!=='Forbundet'){
+      stopRingTone();
+      document.getElementById('voipCallState').textContent='Ikke besvaret';
+      setTimeout(function(){ hangUp(); }, 2000);
+    }
+  }, 180000);
+
+  // Start opkalds-timer
+  voipCallSeconds=0;
+  voipCallTimer=setInterval(function(){
+    voipCallSeconds++;
+    const m=Math.floor(voipCallSeconds/60).toString().padStart(2,'0');
+    const s=(voipCallSeconds%60).toString().padStart(2,'0');
+    document.getElementById('voipCallDuration').textContent=m+':'+s;
+  },1000);
+
+  // Log opkald
+  addCallLog('out',num,voipCallerMode);
+
+  // Rigtig JsSIP opkald
+  if(!ua){
+    showToast('Tilslut gateway først'); hangUp(); return;
+  }
+
+  var callerNum=voipCallerMode==='business'?sipConfig.businessNum:sipConfig.privateNum;
+  var cleanNum=num.replace(/[^0-9+]/g,'');
+
+  // JsSIP opkald via Telnyx
+  if(!ua||!ua.isRegistered()){
+    showToast('Gateway ikke klar — vent og prøv igen');
+    hangUp();
+    return;
+  }
+  try{
+    var callOptions={
+      mediaConstraints:{audio:true,video:false},
+      rtcOfferConstraints:{offerToReceiveAudio:true,offerToReceiveVideo:false},
+      extraHeaders:callerNum?['P-Asserted-Identity: <sip:'+callerNum+'@sip.telnyx.com>']:[],
+      pcConfig:{
+        iceServers:[
+          {urls:'stun:stun.telnyx.com:3478'},
+          {urls:'stun:stun1.l.google.com:19302'}
+        ]
+      }
+    };
+    currentSession=ua.call('sip:'+cleanNum+'@sip.telnyx.com',callOptions);
+    setupSessionHandlers(currentSession);
+    showToast('📞 Ringer til '+cleanNum+'…');
+  }catch(err){
+    showToast('Opkald fejlede: '+err.message);
+    hangUp();
+  }
+}
+
+function hangUp(){
+  stopRingTone();
+  clearTimeout(autoHangupTimer);
+
+  // Vis "Opkald afsluttet" i 1.5 sek inden dialpad vises
+  document.getElementById('voipCallState').textContent='Opkald afsluttet';
+  
+  if(currentSession){
+    try{ currentSession.hangup(); }catch(e){}
+    try{ currentSession.terminate(); }catch(e){}
+    currentSession=null;
+  }
+  // Kald på Relay SDK
+  if(ua && ua.calling && typeof ua.calling.hangup==='function'){
+    try{ ua.calling.hangup(); }catch(e){}
+  }
+
+  voipActive=false;
+  clearInterval(voipCallTimer);
+  if(holdAudio){ holdAudio.pause(); holdAudio=null; }
+
+  setTimeout(function(){
+    document.getElementById('voipCallDisplay').style.display='none';
+    document.getElementById('voipDialpad').style.display='block';
+    document.getElementById('voipCallState').textContent='Ringer…';
+    document.getElementById('voipCallDuration').textContent='00:00';
+    if(ua){
+      document.getElementById('voipStatusDot').style.background='var(--ok)';
+      document.getElementById('voipStatusTxt').style.color='var(--ok)';
+      document.getElementById('voipStatusTxt').textContent='Gateway klar';
+      document.getElementById('voipGateway').textContent='Klar til opkald';
+    }
+  }, 1500);
+}
+
+function toggleMute(){
+  voipMuted=!voipMuted;
+  const btn=document.getElementById('muteBtn');
+  if(voipMuted){
+    btn.style.background='var(--err)'; btn.style.borderColor='var(--err)';
+    btn.textContent='🔇';
+    currentSession?.connection?.getSenders().forEach(s=>{ if(s.track?.kind==='audio') s.track.enabled=false; });
+    showToast('Mikrofon slået fra');
+  } else {
+    btn.style.background='var(--s2)'; btn.style.borderColor='var(--bd)';
+    btn.textContent='🎤';
+    currentSession?.connection?.getSenders().forEach(s=>{ if(s.track?.kind==='audio') s.track.enabled=true; });
+    showToast('Mikrofon aktiv');
+  }
+}
+
+function toggleHold(){
+  voipOnHold=!voipOnHold;
+  const btn=document.getElementById('holdBtn');
+  if(voipOnHold){
+    btn.style.background='var(--warn)'; btn.style.borderColor='var(--warn)';
+    btn.textContent='▶'; 
+    document.getElementById('voipCallState').textContent='På hold';
+    // Start hold-musik (enkel tone via Web Audio)
+    try{
+      const ctx=new (window.AudioContext||window.webkitAudioContext)();
+      // Elevator jazz — blidere og mere behagelig
+      const melody=[
+        [329,0.4],[294,0.4],[261,0.8],
+        [294,0.4],[329,0.4],[349,0.4],[329,0.8],
+        [261,0.4],[294,0.4],[329,0.4],[294,0.8],
+        [246,0.4],[261,0.4],[294,0.4],[261,0.8]
+      ];
+      let idx=0;
+      holdAudio={pause:()=>{ ctx.close(); }};
+      function playElevatorNote(){
+        if(!voipOnHold||!ctx||ctx.state==='closed') return;
+        const [freq,dur]=melody[idx%melody.length];
+        const o=ctx.createOscillator();
+        const g=ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.type='triangle'; // Blødere lyd end sine
+        o.frequency.value=freq;
+        g.gain.setValueAtTime(0,ctx.currentTime);
+        g.gain.linearRampToValueAtTime(0.06,ctx.currentTime+0.05);
+        g.gain.linearRampToValueAtTime(0.06,ctx.currentTime+dur-0.05);
+        g.gain.linearRampToValueAtTime(0,ctx.currentTime+dur);
+        o.start(ctx.currentTime);
+        o.stop(ctx.currentTime+dur);
+        idx++;
+        setTimeout(playElevatorNote, dur*1000+80);
+      }
+      playElevatorNote();
+    }catch(e){}
+    showToast('Opkald sat på hold');
+  } else {
+    btn.style.background='var(--s2)'; btn.style.borderColor='var(--bd)';
+    btn.textContent='⏸';
+    document.getElementById('voipCallState').textContent='Forbundet';
+    if(holdAudio){ holdAudio.pause(); holdAudio=null; }
+    showToast('Opkald genoptaget');
+  }
+}
+
+function toggleSpeaker(){
+  voipSpeaker=!voipSpeaker;
+  const btn=document.getElementById('speakerBtn');
+  if(voipSpeaker){
+    btn.style.background='var(--blue)'; btn.style.borderColor='var(--blue)';
+    btn.textContent='🔊'; showToast('Højttaler aktiveret');
+  } else {
+    btn.style.background='var(--s2)'; btn.style.borderColor='var(--bd)';
+    btn.textContent='🔈'; showToast('Højttaler slået fra');
+  }
+}
+
+function connectSip(){
+  var status=document.getElementById('sipStatus');
+  status.style.display='block';
+  status.style.color='var(--warn)';
+  status.textContent='Tilslutter til Telnyx...';
+
+  if(typeof JsSIP==='undefined'){
+    status.style.color='var(--warn)';
+    status.textContent='Indlæser VoIP bibliotek...';
+    window._onJsSIPReady(function(){ connectSip(); });
+    return;
+  }
+
+  if(ua){ try{ ua.stop(); }catch(e){} ua=null; }
+
+  try{
+    var socket=new JsSIP.WebSocketInterface('wss://sip.telnyx.com:7443');
+    ua=new JsSIP.UA({
+      sockets:[socket],
+      uri:'sip:Frederik007@sip.telnyx.com',
+      password:'Hellothere123!!',
+      authorization_user:'Frederik007',
+      realm:'sip.telnyx.com',
+      register:true,
+      register_expires:300,
+      session_timers:false,
+      hack_via_tcp:false,
+      hack_ip_in_contact:false,
+      no_answer_timeout:60,
+    });
+
+    ua.on('connected',function(){
+      status.textContent='Forbundet — registrerer...';
+      document.getElementById('voipStatusDot').style.background='var(--warn)';
+      document.getElementById('voipStatusTxt').textContent='Registrerer...';
+    });
+
+    ua.on('registered',function(){
+      status.style.color='var(--ok)';
+      status.textContent='Klar til opkald!';
+      document.getElementById('voipStatusDot').style.background='var(--ok)';
+      document.getElementById('voipStatusTxt').style.color='var(--ok)';
+      document.getElementById('voipStatusTxt').textContent='Gateway klar';
+      document.getElementById('voipGateway').textContent='Klar til opkald';
+      document.getElementById('voipGateway').style.color='var(--ok)';
+      var tab=document.getElementById('tab-voip');
+      if(tab&&tab.classList.contains('active')) showToast('✅ Telnyx klar!');
+    });
+
+    ua.on('registrationFailed',function(e){
+      status.style.color='var(--err)';
+      status.textContent='Registrering fejlede: '+(e.cause||'');
+      document.getElementById('voipStatusDot').style.background='var(--err)';
+      document.getElementById('voipStatusTxt').style.color='var(--err)';
+      document.getElementById('voipStatusTxt').textContent='Fejl';
+      document.getElementById('voipGateway').textContent='Tjek credentials';
+      document.getElementById('voipGateway').style.color='var(--err)';
+    });
+
+    ua.on('unregistered',function(){
+      document.getElementById('voipStatusDot').style.background='var(--err)';
+      document.getElementById('voipStatusTxt').style.color='var(--err)';
+      document.getElementById('voipStatusTxt').textContent='Ikke tilsluttet';
+      setTimeout(function(){ if(!ua||!ua.isRegistered()) connectSip(); },5000);
+    });
+
+    ua.on('newRTCSession',function(e){
+      currentSession=e.session;
+      setupSessionHandlers(currentSession);
+    });
+
+    ua.start();
+  }catch(err){
+    status.style.color='var(--err)';
+    status.textContent='Fejl: '+err.message;
+  }
+}
+
+
+function setupSessionHandlers(session){
+  session.on('progress',()=>{ document.getElementById('voipCallState').textContent='Ringer…'; });
+  session.on('accepted',()=>{
+    document.getElementById('voipCallState').textContent='Forbundet';
+    document.getElementById('voipStatusDot').style.background='var(--ok)';
+  });
+  session.on('ended',()=>{ hangUp(); showToast('Opkald afsluttet'); });
+  session.on('failed',(e)=>{ hangUp(); showToast('Opkald fejlede: '+(e.cause||'')); });
+
+  // Tilføj remote audio til siden
+  session.connection?.addEventListener('track',(e)=>{
+    let audio=document.getElementById('remoteAudio');
+    if(!audio){ audio=document.createElement('audio'); audio.id='remoteAudio'; audio.autoplay=true; document.body.appendChild(audio); }
+    audio.srcObject=e.streams[0];
+  });
+}
+
+// Opkaldslog
+function addCallLog(dir,num,mode){
+  document.getElementById('callLogEmpty')?.remove();
+  const list=document.getElementById('callLogList');
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;align-items:center;gap:10px;padding:9px 10px;background:var(--s1);border-radius:8px;';
+  const time=new Date().toLocaleTimeString('da-DK',{hour:'2-digit',minute:'2-digit'});
+  row.innerHTML=`<span style="font-size:16px;">${dir==='out'?'📤':'📥'}</span><div style="flex:1;min-width:0;"><div style="font-size:12px;font-weight:600;">${num}</div><div style="font-size:10px;color:var(--tx3);">${mode==='business'?'Firma':'Privat'} · ${time}</div></div>`;
+  list.prepend(row);
+}
+function clearCallLog(){
+  document.getElementById('callLogList').innerHTML='<div class="empty" id="callLogEmpty"><div class="empty-ico">📞</div><div class="empty-t">Ingen opkald endnu</div></div>';
+}
+
+// Bind refresh buttons og tjek session
+
+document.getElementById('balBadge').addEventListener('click',refreshBalance);
+checkSession();
+
+// Lås bnav position efter første render
+(function(){
+  function lockBnav(){
+    var bnav=document.querySelector('.bnav');
+    if(!bnav) return;
+    var rect=bnav.getBoundingClientRect();
+    var fromBottom=window.innerHeight-rect.bottom;
+    if(fromBottom>2){
+      bnav.style.bottom=fromBottom+'px';
+    }
+  }
+  // Kør straks + efter fonts/billeder er loadet
+  document.addEventListener('DOMContentLoaded', function(){
+    lockBnav();
+    setTimeout(lockBnav, 100);
+    setTimeout(lockBnav, 500);
+  });
+  window.addEventListener('load', function(){
+    lockBnav();
+    setTimeout(lockBnav, 300);
+  });
+})();
+
+// PWA layout + skjul bannere
+(function(){
+  var isPWA=window.navigator.standalone===true||window.matchMedia('(display-mode:standalone)').matches;
+  
+  if(isPWA){
+    ['pwaBannerLanding','pwaBannerInApp','pwaBanner','waInApp'].forEach(function(id){
+      var el=document.getElementById(id); if(el) el.style.display='none';
+    });
+  }
+
+  // Ingen JS scroll fix nødvendig — CSS håndterer det
+})();
+</script>
+</body>
+</html>
