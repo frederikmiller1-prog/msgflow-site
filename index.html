@@ -1220,6 +1220,18 @@ canvas#confetti{position:absolute;inset:0;pointer-events:none;border-radius:22px
         </div>
       </div>
 
+      <!-- EasySendSMS gateway saldo -->
+      <div class="card">
+        <div class="ch" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>EasySendSMS saldo</span>
+          <button onclick="refreshGatewayBalance()" style="background:none;border:none;color:var(--blue);font-size:11px;cursor:pointer;">🔄 Opdater</button>
+        </div>
+        <div class="cb">
+          <div style="font-size:22px;font-weight:700;color:var(--cyan);" id="gatewayBalanceValue">—</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:2px;" id="gatewayBalanceNote">Tryk opdater for at hente saldo</div>
+        </div>
+      </div>
+
       <!-- Admin konto info -->
       <div class="card">
         <div class="ch">Admin konto</div>
@@ -1804,7 +1816,7 @@ function switchTab(id){
   if(id==='send') updateUI();
   if(id==='home') updateHomeStats();
   if(id==='settings') showSubStatus();
-  if(id==='admin'){ document.getElementById('adminCredits').textContent=isAdmin?'∞':userCredits.toLocaleString('da-DK'); document.getElementById('adminContacts').textContent=contacts.length.toLocaleString('da-DK'); const tc=localStorage.getItem('test_credits'); const cur=(tc!==null?parseInt(tc,10):TEST_CREDITS_CURRENT); const el=document.getElementById('adminTestCredits'); if(el) el.textContent=cur.toLocaleString('da-DK')+' credits'; const inp=document.getElementById('adminCreditInput'); if(inp) inp.value=cur; }
+  if(id==='admin'){ document.getElementById('adminCredits').textContent=isAdmin?'∞':userCredits.toLocaleString('da-DK'); document.getElementById('adminContacts').textContent=contacts.length.toLocaleString('da-DK'); const tc=localStorage.getItem('test_credits'); const cur=(tc!==null?parseInt(tc,10):TEST_CREDITS_CURRENT); const el=document.getElementById('adminTestCredits'); if(el) el.textContent=cur.toLocaleString('da-DK')+' credits'; const inp=document.getElementById('adminCreditInput'); if(inp) inp.value=cur; if(typeof refreshGatewayBalance==='function') refreshGatewayBalance(); }
 }
 
 function showSubStatus(){
@@ -2203,6 +2215,29 @@ function refreshBalance(){
   }
 }
 function startAutoRefresh(){}
+
+// ── EASYSENDSMS GATEWAY SALDO (kun admin) ─────────────────────────
+async function refreshGatewayBalance(){
+  const valEl=document.getElementById('gatewayBalanceValue');
+  const noteEl=document.getElementById('gatewayBalanceNote');
+  if(!valEl) return;
+  valEl.textContent='…';
+  noteEl.textContent='Henter…';
+  try{
+    const res=await fetch('/.netlify/functions/get-balance',{method:'GET'});
+    const d=await res.json();
+    if(d.success){
+      valEl.textContent=Number(d.balance).toLocaleString('da-DK')+' SMS';
+      noteEl.textContent='Sidst opdateret: '+new Date().toLocaleTimeString('da-DK',{hour:'2-digit',minute:'2-digit'});
+    } else {
+      valEl.textContent='Fejl';
+      noteEl.textContent=d.error||'Kunne ikke hente saldo';
+    }
+  }catch(e){
+    valEl.textContent='Fejl';
+    noteEl.textContent='Forbindelsesfejl: '+e.message;
+  }
+}
 
 // ── SMS SEND ────────────────────────────────────────────────────
 async function sms(to,body,from){
