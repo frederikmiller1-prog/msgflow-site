@@ -13,11 +13,10 @@ exports.handler = async function () {
 
   try {
     const res = await fetch(BALANCE_URL, {
-      method: 'POST',
+      method: 'GET',
       headers: {
         APIKEY: apiKey,
         'Content-Type': 'application/json',
-        'Content-Length': '0',
       },
     });
 
