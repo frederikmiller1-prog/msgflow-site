@@ -2,7 +2,7 @@
 // Placering i dit repo: netlify/functions/clicksend-send.js
 // Kaldes fra webappen: POST /.netlify/functions/clicksend-send
 //
-// Miljøvariabler i Netlify (Project configuration → Environment variables):
+// Miljøvariabler i Netlify (Site settings → Environment variables):
 //   CLICKSEND_USERNAME   dit ClickSend-brugernavn (det du logger ind med)
 //   CLICKSEND_API_KEY    din ClickSend API-nøgle
 //   SUPABASE_URL         fx https://xxxx.supabase.co
@@ -59,7 +59,23 @@ exports.handler = async (event) => {
   const auth =
     "Basic " + Buffer.from(`${CLICKSEND_USERNAME}:${CLICKSEND_API_KEY}`).toString("base64");
 
-  const result = { accepted: 0, failed: 0, price: 0, errors: [] };
+  const result = { accepted: 0, failed: 0, price: 0, queued: 0, errors: [], details: [], account: null };
+
+  // Hvilken ClickSend-konto hører nøglen til, og hvad er saldoen?
+  try {
+    const accRes = await fetch("https://rest.clicksend.com/v3/account", {
+      headers: { Authorization: auth },
+    });
+    const acc = await accRes.json();
+    if (accRes.ok && acc.data) {
+      result.account = {
+        username: acc.data.username,
+        email: acc.data.user_email,
+        balance: acc.data.balance,
+        currency: acc.data._currency?.currency_name_short,
+      };
+    }
+  } catch {}
 
   for (let i = 0; i < to.length; i += BATCH_SIZE) {
     const batch = to.slice(i, i + BATCH_SIZE);
@@ -85,6 +101,11 @@ exports.handler = async (event) => {
       }
 
       for (const m of data.data?.messages || []) {
+        if (result.details.length < 20) {
+          result.details.push(
+            `${m.to} · status ${m.status} · id ${m.message_id} · pris ${m.message_price} · fra ${m.from}`
+          );
+        }
         if (m.status === "SUCCESS") result.accepted++;
         else {
           result.failed++;
@@ -92,6 +113,7 @@ exports.handler = async (event) => {
         }
       }
       result.price += Number(data.data?.total_price || 0);
+      result.queued += Number(data.data?.queued_count || 0);
     } catch (err) {
       result.failed += batch.length;
       result.errors.push(err.message);
