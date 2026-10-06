@@ -48,6 +48,33 @@ exports.handler = async (event) => {
     return json(400, { error: "Ugyldig JSON" });
   }
 
+  const auth =
+    "Basic " + Buffer.from(`${CLICKSEND_USERNAME}:${CLICKSEND_API_KEY}`).toString("base64");
+
+  // Statusopslag: de seneste beskeder, som ClickSend selv har registreret dem
+  if (payload.action === "history") {
+    try {
+      const res = await fetch("https://rest.clicksend.com/v3/sms/history?limit=10", {
+        headers: { Authorization: auth },
+      });
+      const data = await res.json();
+      if (!res.ok) return json(502, { error: data.response_msg || `HTTP ${res.status}` });
+      const messages = (data.data?.data || []).map((m) => ({
+        date: m.date,
+        to: m.to,
+        from: m.from,
+        status: m.status,
+        status_text: m.status_text,
+        error_text: m.error_text,
+        price: m.message_price,
+        id: m.message_id,
+      }));
+      return json(200, { total: data.data?.total, messages });
+    } catch (err) {
+      return json(502, { error: err.message });
+    }
+  }
+
   const body = String(payload.body || "").trim();
   const from = payload.from ? String(payload.from).trim() : undefined;
   const to = [...new Set((payload.to || []).map((n) => String(n).replace(/[\s-]/g, "")))]
@@ -55,9 +82,6 @@ exports.handler = async (event) => {
 
   if (!body) return json(400, { error: "Beskeden er tom" });
   if (!to.length) return json(400, { error: "Ingen gyldige modtagere" });
-
-  const auth =
-    "Basic " + Buffer.from(`${CLICKSEND_USERNAME}:${CLICKSEND_API_KEY}`).toString("base64");
 
   const result = { accepted: 0, failed: 0, price: 0, queued: 0, errors: [], details: [], account: null };
 
