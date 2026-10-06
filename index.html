@@ -1016,6 +1016,19 @@ canvas#confetti{position:absolute;inset:0;pointer-events:none;border-radius:22px
       </div>
 
       <div class="card">
+        <div class="ch">SMS-gateway</div>
+        <div class="cb">
+          <div class="field">
+            <label class="lbl">Send via</label>
+            <select id="gatewaySelect" onchange="setGateway(this.value)">
+              <option value="easysend">EasySendSMS (standard)</option>
+              <option value="clicksend">ClickSend</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="ch">Besked</div>
         <div class="cb" style="display:flex;flex-direction:column;gap:12px;">
           <div class="field">
@@ -2121,6 +2134,18 @@ function scrollToPricing(){
 
 // ── STATE ───────────────────────────────────────────────────────
 const SMS_API='/.netlify/functions/send-sms';
+const CLICKSEND_API='/.netlify/functions/clicksend-send';
+const CLICKSEND_BATCH=500;
+function getGateway(){ return localStorage.getItem('ms_gw')==='clicksend'?'clicksend':'easysend'; }
+function setGateway(v){
+  localStorage.setItem('ms_gw', v==='clicksend'?'clicksend':'easysend');
+  const sub=document.getElementById('smsGwSub');
+  if(sub) sub.textContent='Klar til SMS via '+(getGateway()==='clicksend'?'ClickSend':'EasySendSMS');
+}
+document.addEventListener('DOMContentLoaded',function(){
+  const sel=document.getElementById('gatewaySelect');
+  if(sel){ sel.value=getGateway(); setGateway(sel.value); }
+});
 let contacts=JSON.parse(localStorage.getItem('ms_ct')||'[]');
 let logs=[],isSending=false,cancelFlag=false;
 
@@ -2260,6 +2285,11 @@ async function doSend(){
     showErrorPopup('Du mangler credits. Afsendelse kræver '+cost.toLocaleString('da-DK')+' credits, men du har kun '+userCredits.toLocaleString('da-DK')+'.');
     return;
   }
+  const gateway=getGateway();
+  if(gateway==='clicksend' && !sbToken){
+    showErrorPopup('ClickSend kræver login med en rigtig brugerkonto. Den lokale admin-/testkonto kan ikke sende via ClickSend – vælg EasySendSMS eller log ind som bruger.');
+    return;
+  }
   isSending=true;cancelFlag=false;
   document.getElementById('progressCard').style.display='block';
   document.getElementById('sendBtn').disabled=true;
@@ -2270,6 +2300,30 @@ async function doSend(){
   let sent=0,failed=0;
   const total=contacts.length;
   const startCredits=userCredits;
+  if(gateway==='clicksend'){
+    for(let i=0;i<contacts.length;i+=CLICKSEND_BATCH){
+      if(cancelFlag){addLog('warn','Annulleret');break;}
+      const batch=contacts.slice(i,i+CLICKSEND_BATCH);
+      try{
+        const res=await fetch(CLICKSEND_API,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+sbToken},body:JSON.stringify({to:batch.map(c=>c.number),body:msg,from:sender})});
+        let d={}; try{ d=await res.json(); }catch(e){}
+        if(!res.ok) throw new Error(d.error||('HTTP '+res.status));
+        const acc=Math.min(batch.length, d.accepted||0);
+        sent+=acc; failed+=batch.length-acc;
+        if(acc>0) addLog('ok',`✓ ${acc} accepteret via ClickSend`);
+        (d.errors||[]).forEach(x=>addLog('err','✗ '+x));
+      }catch(e){ failed+=batch.length; addLog('err','✗ ClickSend: '+e.message); }
+      // Credits trækkes kun for beskeder ClickSend har accepteret
+      if(!isAdmin){
+        userCredits=Math.max(0, startCredits - sent*credPerContact);
+        saveCredits(); refreshBalance(); updateHomeStats();
+      }
+      const pct=Math.round(((sent+failed)/total)*100);
+      setP(sent,failed,total,pct);
+      document.getElementById('sendingBar').style.width=pct+'%';
+      document.getElementById('sendingPct').textContent=pct+'%';
+    }
+  } else
   for(let i=0;i<contacts.length;i+=50){
     if(cancelFlag){addLog('warn','Annulleret');break;}
     await Promise.all(contacts.slice(i,i+50).map(async c=>{
