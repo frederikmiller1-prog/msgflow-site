@@ -2322,6 +2322,9 @@ async function doSend(){
         sent+=acc; failed+=batch.length-acc;
         if(acc>0) addLog('ok',`✓ ${acc} accepteret via ClickSend`);
         (d.errors||[]).forEach(x=>addLog('err','✗ '+x));
+        if(d.account) addLog('warn','ClickSend-konto: '+d.account.username+' ('+(d.account.email||'')+') · saldo '+d.account.balance+' '+(d.account.currency||''));
+        addLog('warn','ClickSend: '+(d.queued||0)+' i kø · pris i alt '+(d.price||0));
+        (d.details||[]).forEach(x=>addLog('warn',x));
       }catch(e){ failed+=batch.length; addLog('err','✗ ClickSend: '+e.message); }
       // Credits trækkes kun for beskeder ClickSend har accepteret
       if(!isAdmin){
