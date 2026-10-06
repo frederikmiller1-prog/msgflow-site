@@ -1025,6 +1025,7 @@ canvas#confetti{position:absolute;inset:0;pointer-events:none;border-radius:22px
               <option value="clicksend">ClickSend</option>
             </select>
           </div>
+          <button class="btn btn-ghost btn-sm" style="margin-top:10px;" onclick="checkClickSendStatus()">Tjek ClickSend-status</button>
         </div>
       </div>
 
@@ -2136,6 +2137,35 @@ function scrollToPricing(){
 const SMS_API='/.netlify/functions/send-sms';
 const CLICKSEND_API='/.netlify/functions/clicksend-send';
 const CLICKSEND_BATCH=500;
+async function getClickSendToken(){
+  if(sbToken) return sbToken;
+  if(isAdmin && USE_SUPABASE){
+    try{
+      const d=await sbFetch('/auth/v1/token?grant_type=password',{email:ADMIN_EMAIL,password:ADMIN_PASS});
+      return d.access_token||null;
+    }catch(e){}
+  }
+  return null;
+}
+// Henter de seneste beskeder fra ClickSend og skriver deres status i loggen
+async function checkClickSendStatus(){
+  const token=await getClickSendToken();
+  if(!token){ showToast('Log ind for at tjekke ClickSend'); return; }
+  showToast('Henter status fra ClickSend…');
+  try{
+    const res=await fetch(CLICKSEND_API,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({action:'history'})});
+    let d={}; try{ d=await res.json(); }catch(e){}
+    if(!res.ok) throw new Error(d.error||('HTTP '+res.status));
+    const list=(d.messages||[]).slice().reverse();
+    if(!list.length) addLog('warn','ClickSend-historik: ingen beskeder fundet (i alt '+(d.total||0)+')');
+    list.forEach(m=>{
+      const t=m.date?new Date(m.date*1000).toLocaleTimeString('da-DK'):'';
+      addLog(m.status==='Sent'||m.status==='Completed'?'ok':'warn',
+        'ClickSend '+t+' · '+m.to+' · STATUS '+m.status+(m.status_text?' ('+m.status_text+')':'')+(m.error_text?' · fejl: '+m.error_text:'')+' · fra '+m.from+' · pris '+m.price);
+    });
+    switchTab('log');
+  }catch(e){ addLog('err','✗ ClickSend-status: '+e.message); switchTab('log'); }
+}
 function getGateway(){ return localStorage.getItem('ms_gw')==='clicksend'?'clicksend':'easysend'; }
 function setGateway(v){
   localStorage.setItem('ms_gw', v==='clicksend'?'clicksend':'easysend');
@@ -2287,13 +2317,7 @@ async function doSend(){
   }
   const gateway=getGateway();
   // ClickSend kræver et rigtigt Supabase-login. Admin logges ind i baggrunden med admin-email og -kode.
-  let csToken=sbToken;
-  if(gateway==='clicksend' && !csToken && isAdmin && USE_SUPABASE){
-    try{
-      const d=await sbFetch('/auth/v1/token?grant_type=password',{email:ADMIN_EMAIL,password:ADMIN_PASS});
-      csToken=d.access_token||null;
-    }catch(e){}
-  }
+  const csToken = gateway==='clicksend' ? await getClickSendToken() : sbToken;
   if(gateway==='clicksend' && !csToken){
     showErrorPopup(isAdmin
       ? 'ClickSend kunne ikke logge admin ind. Opret en bruger under Admin med email '+ADMIN_EMAIL+' og samme adgangskode som dit admin-login, og prøv igen.'
