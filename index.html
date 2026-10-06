@@ -2286,8 +2286,18 @@ async function doSend(){
     return;
   }
   const gateway=getGateway();
-  if(gateway==='clicksend' && !sbToken){
-    showErrorPopup('ClickSend kræver login med en rigtig brugerkonto. Den lokale admin-/testkonto kan ikke sende via ClickSend – vælg EasySendSMS eller log ind som bruger.');
+  // ClickSend kræver et rigtigt Supabase-login. Admin logges ind i baggrunden med admin-email og -kode.
+  let csToken=sbToken;
+  if(gateway==='clicksend' && !csToken && isAdmin && USE_SUPABASE){
+    try{
+      const d=await sbFetch('/auth/v1/token?grant_type=password',{email:ADMIN_EMAIL,password:ADMIN_PASS});
+      csToken=d.access_token||null;
+    }catch(e){}
+  }
+  if(gateway==='clicksend' && !csToken){
+    showErrorPopup(isAdmin
+      ? 'ClickSend kunne ikke logge admin ind. Opret en bruger under Admin med email '+ADMIN_EMAIL+' og samme adgangskode som dit admin-login, og prøv igen.'
+      : 'ClickSend kræver login med en rigtig brugerkonto – log ud og ind igen, eller vælg EasySendSMS.');
     return;
   }
   isSending=true;cancelFlag=false;
@@ -2305,7 +2315,7 @@ async function doSend(){
       if(cancelFlag){addLog('warn','Annulleret');break;}
       const batch=contacts.slice(i,i+CLICKSEND_BATCH);
       try{
-        const res=await fetch(CLICKSEND_API,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+sbToken},body:JSON.stringify({to:batch.map(c=>c.number),body:msg,from:sender})});
+        const res=await fetch(CLICKSEND_API,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+csToken},body:JSON.stringify({to:batch.map(c=>c.number),body:msg,from:sender})});
         let d={}; try{ d=await res.json(); }catch(e){}
         if(!res.ok) throw new Error(d.error||('HTTP '+res.status));
         const acc=Math.min(batch.length, d.accepted||0);
